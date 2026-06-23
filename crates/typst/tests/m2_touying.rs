@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use paladocs_typst::Engine;
+use paladocs_typst::{PaladocsWorld, compile_deck};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/touying_pause.typ")
@@ -14,8 +14,9 @@ fn fixture() -> PathBuf {
 #[test]
 #[ignore = "requires network: fetches @preview/touying"]
 fn pdfpc_groups_overlays_into_steps_and_carries_notes() {
-    let engine = Engine::compile(&fixture()).expect("touying deck should compile");
-    let deck = engine.deck();
+    let world = PaladocsWorld::new(&fixture()).expect("world builds");
+    let compiled = compile_deck(&world).expect("touying deck should compile");
+    let deck = &compiled.deck;
     deck.validate().expect("deck invariants hold");
 
     // 2 論理スライド: 1 枚目は #pause により 2 step、2 枚目は 1 step。
@@ -42,12 +43,13 @@ fn pdfpc_groups_overlays_into_steps_and_carries_notes() {
 fn touying_deck_renders_and_exports_pdf() {
     use paladocs_core::FrameId;
 
-    let engine = Engine::compile(&fixture()).expect("touying deck should compile");
+    let world = PaladocsWorld::new(&fixture()).expect("world builds");
+    let compiled = compile_deck(&world).expect("touying deck should compile");
     // 各フレームが描画でき、PDF も出る（pdfpc とは独立に動く）。
-    for i in 0..engine.deck().frame_count() as u32 {
-        let frame = engine.render_frame(FrameId(i), 1.0).unwrap();
+    for i in 0..compiled.deck.frame_count() as u32 {
+        let frame = compiled.render_frame(FrameId(i), 1.0).unwrap();
         assert!(frame.image.size().w > 0 && frame.image.size().h > 0);
     }
-    let pdf = engine.to_pdf().unwrap();
+    let pdf = compiled.to_pdf(&world).unwrap();
     assert_eq!(&pdf[..4], b"%PDF");
 }

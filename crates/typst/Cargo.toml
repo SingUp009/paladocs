@@ -25,6 +25,15 @@ typst-kit = { version = "=0.15.0", default-features = false, features = [
 ] }
 typst-assets = { version = "=0.15.0", features = ["fonts"] }
 comemo = "0.4"
+# Typst の警告診断（`Warned.warnings: EcoVec<SourceDiagnostic>`）を `CompiledDeck`
+# にそのまま保持するため、コレクション型 `EcoVec` を名指しできるよう直接依存させる。
+ecow = "0.2"
+# テキストセルの占有幅（East Asian Width で Narrow / Wide を判定）。便利依存は
+# typst クレートに隔離する規律に従い、ここだけで使う。
+unicode-width = "0.2"
+# 現在日付（`datetime.today()`）を World に供給する。ローカルタイムゾーンを
+# マルチスレッドでも安全に解決できるため `time` ではなく chrono を使う。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Must match the tiny-skia version used by typst-render 0.15 (0.12) so that the
 # `Pixmap` type returned by `typst_render::render` unifies with ours.
 tiny-skia = "0.12"

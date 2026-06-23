@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use chrono::{Datelike, Duration as ChronoDuration, Local, Utc};
 use typst::World;
 use typst::diag::FileResult;
 use typst::foundations::{Bytes, Datetime, Duration};
@@ -20,7 +21,11 @@ use crate::EngineError;
 
 /// Paladocs の [`World`]。1 つのプロジェクトルートと entrypoint（`root.typ`）を
 /// 持ち、相対 import とパッケージ（`@preview/...`）を解決する。
-pub(crate) struct PaladocsWorld {
+///
+/// 上位（`cli`）が所有して [`compile_deck`](crate::compile_deck) に渡し、reload 時は
+/// [`reset_files`](PaladocsWorld::reset_files) でファイルキャッシュを stale 化してから
+/// 再コンパイルする。
+pub struct PaladocsWorld {
     library: LazyHash<Library>,
     fonts: FontStore,
     files: FileStore<SystemFiles>,
@@ -33,7 +38,7 @@ impl PaladocsWorld {
     /// プロジェクトルートは `root` の親ディレクトリ。フォントは埋め込み
     /// （`typst-assets`）+ システムフォントを探索する。パッケージは Typst
     /// Universe（`@preview`）から取得・キャッシュする。
-    pub(crate) fn new(root: &Path) -> Result<Self, EngineError> {
+    pub fn new(root: &Path) -> Result<Self, EngineError> {
         let root = root
             .canonicalize()
             .map_err(|e| EngineError::Io(format!("{}: {e}", root.display())))?;
@@ -69,7 +74,7 @@ impl PaladocsWorld {
 
     /// reload 用にファイルキャッシュを stale 化する。次のアクセスでローダ経由で
     /// 再読込される（[`FileStore::reset`]）。
-    pub(crate) fn reset_files(&mut self) {
+    pub fn reset_files(&mut self) {
         self.files.reset();
     }
 }
@@ -99,8 +104,21 @@ impl World for PaladocsWorld {
         self.fonts.font(index)
     }
 
-    /// 再現可能な PDF を優先し、日付は常に `None` を返す（現在時刻に依存しない）。
-    fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
-        None
+    /// 現在の日付を返す。`offset` が無ければシステムのローカルタイムゾーン、
+    /// あれば UTC からその時間幅だけずらした日付を用いる（Typst の
+    /// `datetime.today(offset)` 相当）。
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+        let naive = match offset {
+            None => Local::now().naive_local(),
+            Some(o) => {
+                let secs = o.seconds().round() as i64;
+                (Utc::now() + ChronoDuration::seconds(secs)).naive_utc()
+            }
+        };
+        Datetime::from_ymd(
+            naive.year(),
+            naive.month().try_into().ok()?,
+            naive.day().try_into().ok()?,
+        )
     }
 }

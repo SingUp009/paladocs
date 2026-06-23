@@ -19,6 +19,12 @@ pub fn report_engine_error(sink: &mut dyn Write, err: &EngineError) -> io::Resul
         EngineError::Render(msg) => write_message(sink, "render", msg),
         EngineError::Io(msg) => write_message(sink, "io", msg),
         EngineError::Package(msg) => write_message(sink, "package", msg),
+        EngineError::PdfpcMissing => write_message(
+            sink,
+            "pdfpc",
+            "deck must enable Touying pdfpc (enable-pdfpc: true)",
+        ),
+        EngineError::PdfpcSchema(msg) => write_message(sink, "pdfpc", msg),
     }
 }
 

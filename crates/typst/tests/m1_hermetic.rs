@@ -1,15 +1,21 @@
 //! M1 の hermetic 統合テスト（ネットワーク不要）。
 //!
 //! Touying を使わない最小 Typst の inline ソースを一時ディレクトリに書き出し、
-//! [`Engine::compile`] からのフルパイプライン（compile → Deck → render → PDF →
-//! 診断）を検証する。埋め込みフォントのみを使うためオフラインで完結する。
+//! [`compile_deck`] からのフルパイプライン（compile → Deck → render → PDF →
+//! 診断 → ページ→セル投影）を検証する。埋め込みフォントのみを使うためオフライン
+//! で完結する。
+//!
+//! 構造抽出は strict（pdfpc 必須）なので、各ソースには [`pdfpc`] ヘルパで
+//! `<pdfpc-file>` メタデータを inline 注入する（Touying 非依存のまま）。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use paladocs_core::FrameId;
-use paladocs_render::PixelSize;
-use paladocs_typst::{Engine, EngineError};
+use paladocs_render::{CellWidth, PixelSize};
+use paladocs_typst::{
+    CompiledDeck, EngineError, PaladocsWorld, RenderOpts, compile_deck, render_step,
+};
 
 /// テスト用の一意な一時ディレクトリ。Drop で再帰削除する。
 struct TempProject {
@@ -43,11 +49,30 @@ impl Drop for TempProject {
     }
 }
 
+/// `<pdfpc-file>` メタデータ（pdfpcFormat 2）を inline 生成する。
+///
+/// `pages` は `(idx, label)` の列。連続する同一 `label` が 1 スライドの overlay 群
+/// に畳まれる（Touying 非使用でも strict 構造抽出が通るようにするため）。
+fn pdfpc(pages: &[(u32, &str)]) -> String {
+    let entries: String = pages
+        .iter()
+        .map(|(idx, label)| format!("(idx: {idx}, label: \"{label}\", overlay: 0, hidden: false),"))
+        .collect();
+    format!("#metadata((pdfpcFormat: 2, pages: ({entries})))<pdfpc-file>\n")
+}
+
+/// `source` をコンパイルして `(World, CompiledDeck)` を返す（成功前提）。
+fn compile_ok(project: &TempProject) -> (PaladocsWorld, CompiledDeck) {
+    let world = PaladocsWorld::new(&project.root()).expect("world builds");
+    let compiled = compile_deck(&world).expect("compile should succeed");
+    (world, compiled)
+}
+
 #[test]
 fn compile_single_page_and_validate() {
-    let project = TempProject::new("= Hello, Paladocs");
-    let engine = Engine::compile(&project.root()).expect("compile should succeed");
-    let deck = engine.deck();
+    let project = TempProject::new(&(pdfpc(&[(0, "1")]) + "= Hello, Paladocs"));
+    let (_world, compiled) = compile_ok(&project);
+    let deck = &compiled.deck;
     assert_eq!(deck.frame_count(), 1);
     assert_eq!(deck.slides.len(), 1);
     assert_eq!(deck.slides[0].steps.len(), 1);
@@ -56,25 +81,61 @@ fn compile_single_page_and_validate() {
 
 #[test]
 fn compile_multi_page() {
-    let project = TempProject::new("First\n#pagebreak()\nSecond\n#pagebreak()\nThird");
-    let engine = Engine::compile(&project.root()).unwrap();
-    let deck = engine.deck();
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1"), (1, "2"), (2, "3")])
+            + "First\n#pagebreak()\nSecond\n#pagebreak()\nThird"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    assert_eq!(compiled.deck.frame_count(), 3);
+    // 各ページが独立 label なので 1-step スライド×3。
+    assert_eq!(compiled.deck.slides.len(), 3);
+}
+
+#[test]
+fn pdfpc_groups_overlays_into_one_slide() {
+    // 連続同一 label ("1","1") は 2 step に畳まれ、"2" は別スライド 1 step。
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1"), (1, "1"), (2, "2")])
+            + "First\n#pagebreak()\nFirst.2\n#pagebreak()\nSecond"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let deck = &compiled.deck;
+    assert_eq!(deck.slides.len(), 2);
+    assert_eq!(deck.slides[0].steps.len(), 2);
+    assert_eq!(deck.slides[1].steps.len(), 1);
     assert_eq!(deck.frame_count(), 3);
-    // pdfpc メタの無いプレーンデッキ: N ページ → N スライド、各スライド 1 step。
-    // 空 Deck / 1 スライド固定の no-op フォールバックではここで落ちる。
-    assert_eq!(deck.slides.len(), 3);
-    for (i, slide) in deck.slides.iter().enumerate() {
-        assert_eq!(slide.steps.len(), 1, "slide {i} must have exactly one step");
-        assert_eq!(slide.steps[0].frame, FrameId(i as u32));
-    }
+    assert_eq!(deck.slides[0].steps[0].frame, FrameId(0));
+    assert_eq!(deck.slides[0].steps[1].frame, FrameId(1));
+    assert_eq!(deck.slides[1].steps[0].frame, FrameId(2));
+}
+
+#[test]
+fn pdfpc_missing_is_explicit_error() {
+    // pdfpc メタ無し（Touying 非使用）→ 無音フォールバックせず PdfpcMissing。
+    let project = TempProject::new("= No pdfpc here");
+    let world = PaladocsWorld::new(&project.root()).unwrap();
+    let err = compile_deck(&world).unwrap_err();
+    assert!(matches!(err, EngineError::PdfpcMissing), "got {err:?}");
+}
+
+#[test]
+fn pdfpc_wrong_format_is_schema_error() {
+    // pdfpcFormat != 2 → スキーマエラー（無音フォールバック禁止）。
+    let project =
+        TempProject::new("#metadata((pdfpcFormat: 1, pages: ()))<pdfpc-file>\n= Bad format");
+    let world = PaladocsWorld::new(&project.root()).unwrap();
+    let err = compile_deck(&world).unwrap_err();
+    assert!(matches!(err, EngineError::PdfpcSchema(_)), "got {err:?}");
 }
 
 #[test]
 fn render_frame_has_expected_size() {
     // ページサイズを固定し、ppp から決まる pixel 寸法を確認する。
-    let project = TempProject::new("#set page(width: 100pt, height: 50pt, margin: 0pt)\nHi");
-    let engine = Engine::compile(&project.root()).unwrap();
-    let frame = engine.render_frame(FrameId(0), 2.0).unwrap();
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")]) + "#set page(width: 100pt, height: 50pt, margin: 0pt)\nHi"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let frame = compiled.render_frame(FrameId(0), 2.0).unwrap();
     assert_eq!(frame.id, FrameId(0));
     // pxw = round(2.0 * 100) = 200, pxh = round(2.0 * 50) = 100
     assert_eq!(frame.image.size(), PixelSize { w: 200, h: 100 });
@@ -82,9 +143,9 @@ fn render_frame_has_expected_size() {
 
 #[test]
 fn render_frame_out_of_range() {
-    let project = TempProject::new("= Only one page");
-    let engine = Engine::compile(&project.root()).unwrap();
-    let err = engine.render_frame(FrameId(5), 1.0).unwrap_err();
+    let project = TempProject::new(&(pdfpc(&[(0, "1")]) + "= Only one page"));
+    let (_world, compiled) = compile_ok(&project);
+    let err = compiled.render_frame(FrameId(5), 1.0).unwrap_err();
     assert!(matches!(err, EngineError::Render(_)), "got {err:?}");
 }
 
@@ -92,10 +153,11 @@ fn render_frame_out_of_range() {
 fn opaque_page_fill_roundtrips_exactly() {
     // 不透明なページ背景色がストレートアルファでそのまま出る（a=255）。
     let project = TempProject::new(
-        "#set page(width: 8pt, height: 8pt, margin: 0pt, fill: rgb(20, 40, 60))\n#none",
+        &(pdfpc(&[(0, "1")])
+            + "#set page(width: 8pt, height: 8pt, margin: 0pt, fill: rgb(20, 40, 60))\n#none"),
     );
-    let engine = Engine::compile(&project.root()).unwrap();
-    let frame = engine.render_frame(FrameId(0), 1.0).unwrap();
+    let (_world, compiled) = compile_ok(&project);
+    let frame = compiled.render_frame(FrameId(0), 1.0).unwrap();
     let center = frame.image.pixel(4, 4).unwrap();
     assert_eq!(center, [20, 40, 60, 255]);
 }
@@ -103,16 +165,14 @@ fn opaque_page_fill_roundtrips_exactly() {
 #[test]
 fn semitransparent_fill_is_straight_alpha() {
     // 半透明背景: ストレートアルファ（非プリマルチプライド）であることを確認する。
-    // プリマルチプライドのままなら R ≈ round(20*128/255) ≈ 10 になるが、
-    // ストレートなら R ≈ 20 に戻る。
     let project = TempProject::new(
-        "#set page(width: 8pt, height: 8pt, margin: 0pt, fill: rgb(20, 40, 60, 128))\n#none",
+        &(pdfpc(&[(0, "1")])
+            + "#set page(width: 8pt, height: 8pt, margin: 0pt, fill: rgb(20, 40, 60, 128))\n#none"),
     );
-    let engine = Engine::compile(&project.root()).unwrap();
-    let frame = engine.render_frame(FrameId(0), 1.0).unwrap();
+    let (_world, compiled) = compile_ok(&project);
+    let frame = compiled.render_frame(FrameId(0), 1.0).unwrap();
     let [r, g, b, a] = frame.image.pixel(4, 4).unwrap();
     assert_eq!(a, 128, "alpha should be preserved");
-    // ストレート値（~20,40,60）に近く、プリマルチプライド値（~10,20,30）から離れる。
     assert!(
         (15..=25).contains(&r),
         "r = {r} (expected ~20, not premultiplied ~10)"
@@ -130,31 +190,33 @@ fn semitransparent_fill_is_straight_alpha() {
 #[test]
 fn render_fit_letterboxes_into_viewport() {
     // 100x50pt (2:1) を 200x200 ビューポートに収める → 200x100 に収まる。
-    let project = TempProject::new("#set page(width: 100pt, height: 50pt, margin: 0pt)\nHi");
-    let engine = Engine::compile(&project.root()).unwrap();
-    let frame = engine
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")]) + "#set page(width: 100pt, height: 50pt, margin: 0pt)\nHi"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let frame = compiled
         .render_fit(FrameId(0), PixelSize { w: 200, h: 200 })
         .unwrap();
     let size = frame.image.size();
-    // 実寸は fit 矩形と ±1px ずれうる。
     assert!((199..=201).contains(&size.w), "w = {}", size.w);
     assert!((99..=101).contains(&size.h), "h = {}", size.h);
 }
 
 #[test]
 fn to_pdf_starts_with_pdf_magic() {
-    let project = TempProject::new("= PDF export");
-    let engine = Engine::compile(&project.root()).unwrap();
-    let bytes = engine.to_pdf().unwrap();
+    let project = TempProject::new(&(pdfpc(&[(0, "1")]) + "= PDF export"));
+    let (world, compiled) = compile_ok(&project);
+    let bytes = compiled.to_pdf(&world).unwrap();
     assert!(bytes.len() > 4);
     assert_eq!(&bytes[..4], b"%PDF");
 }
 
 #[test]
 fn bad_source_yields_compile_error_with_location() {
-    // 未知変数の参照は span 付きのコンパイルエラーになる。
+    // 未知変数の参照は span 付きのコンパイルエラーになる（pdfpc 以前に失敗する）。
     let project = TempProject::new("Intro line\n#undefined_variable");
-    let err = match Engine::compile(&project.root()) {
+    let world = PaladocsWorld::new(&project.root()).unwrap();
+    let err = match compile_deck(&world) {
         Ok(_) => panic!("expected compilation to fail"),
         Err(e) => e,
     };
@@ -163,7 +225,6 @@ fn bad_source_yields_compile_error_with_location() {
     };
     assert!(!diags.is_empty(), "should have at least one diagnostic");
     let d = &diags[0];
-    // 2 行目を指し、行/列が 1 始まりで取れている。
     assert_eq!(d.line, 2, "diagnostic: {d:?}");
     assert!(d.col >= 1, "col should be 1-based: {d:?}");
     assert_eq!(d.file, "root.typ", "diagnostic: {d:?}");
@@ -171,12 +232,103 @@ fn bad_source_yields_compile_error_with_location() {
 }
 
 #[test]
-fn reload_picks_up_source_changes() {
-    let project = TempProject::new("One\n#pagebreak()\nTwo");
-    let mut engine = Engine::compile(&project.root()).unwrap();
-    assert_eq!(engine.deck().frame_count(), 2);
+fn datetime_today_is_available() {
+    // `datetime.today()` を使うソースは、World が現在日付を提供するためコンパイルできる。
+    let project = TempProject::new(&(pdfpc(&[(0, "1")]) + "#datetime.today().display()"));
+    let world = PaladocsWorld::new(&project.root()).unwrap();
+    compile_deck(&world).expect("compile with datetime.today() should succeed");
+}
 
-    project.rewrite("Only one page now");
-    engine.reload().unwrap();
-    assert_eq!(engine.deck().frame_count(), 1);
+#[test]
+fn datetime_today_with_offset_is_available() {
+    let project = TempProject::new(&(pdfpc(&[(0, "1")]) + "#datetime.today(offset: 9).display()"));
+    let world = PaladocsWorld::new(&project.root()).unwrap();
+    compile_deck(&world).expect("compile with datetime.today(offset) should succeed");
+}
+
+#[test]
+fn reload_picks_up_source_changes() {
+    let project = TempProject::new(&(pdfpc(&[(0, "1"), (1, "2")]) + "One\n#pagebreak()\nTwo"));
+    let mut world = PaladocsWorld::new(&project.root()).unwrap();
+    let compiled = compile_deck(&world).unwrap();
+    assert_eq!(compiled.deck.frame_count(), 2);
+
+    project.rewrite(&(pdfpc(&[(0, "1")]) + "Only one page now"));
+    world.reset_files();
+    let compiled = compile_deck(&world).unwrap();
+    assert_eq!(compiled.deck.frame_count(), 1);
+}
+
+// ---- B: ページ→セル投影（render_step）----
+
+#[test]
+fn render_step_dims_and_opacity() {
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")]) + "#set page(width: 100pt, height: 50pt, margin: 0pt)\n= Hi"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let opts = RenderOpts {
+        cols: 20,
+        rows: 8,
+        pixel_per_pt: 3.0,
+    };
+    let grid = render_step(&compiled, 0, &opts).unwrap();
+    assert_eq!(grid.dims(), (20, 8)); // 不変条件4: dims
+    for row in grid.rows() {
+        for cell in row {
+            assert_eq!(cell.fg[3], 255, "fg opaque");
+            assert_eq!(cell.bg[3], 255, "bg opaque");
+            // 不変条件5: Wide の右隣は必ず Continuation。
+        }
+        for (c, cell) in row.iter().enumerate() {
+            if cell.width == CellWidth::Wide {
+                assert_eq!(row[c + 1].width, CellWidth::Continuation);
+            }
+        }
+    }
+}
+
+#[test]
+fn render_step_solid_page_no_text_stays_base() {
+    // 単色ページ・テキスト無し → 全セルが背景色・▀（上書きゼロ）。
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")])
+            + "#set page(width: 100pt, height: 50pt, margin: 0pt, fill: rgb(20, 40, 60))\n#none"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let opts = RenderOpts {
+        cols: 16,
+        rows: 6,
+        pixel_per_pt: 2.0,
+    };
+    let grid = render_step(&compiled, 0, &opts).unwrap();
+    for row in grid.rows() {
+        for cell in row {
+            assert_eq!(cell.fg, [20, 40, 60, 255]);
+            assert_eq!(cell.bg, [20, 40, 60, 255]);
+            assert_eq!(cell.ch, '\u{2580}', "no text → half-block base only");
+        }
+    }
+}
+
+#[test]
+fn render_step_latin_text_overwrites_cells() {
+    // ラテン文字を含むページ → グリフセルが base のもやけ ▀ から鮮明な文字へ置換される。
+    // 判別: テキスト無しページ（上のテスト）は文字セルゼロ。
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")])
+            + "#set page(width: 200pt, height: 40pt, margin: 4pt, fill: white)\n#text(size: 20pt)[Hello]"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let opts = RenderOpts {
+        cols: 80,
+        rows: 16,
+        pixel_per_pt: 4.0,
+    };
+    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let has_letter = grid
+        .rows()
+        .flat_map(|r| r.iter())
+        .any(|c| c.ch.is_ascii_alphabetic());
+    assert!(has_letter, "latin text should place letter cells");
 }

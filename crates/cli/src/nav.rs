@@ -183,6 +183,30 @@ fn goto_present(state: &mut PresentState, deck: &Deck, target: Option<FrameId>) 
     }
 }
 
+/// 純粋: 現状態から「次に必要になりそうなフレーム」を優先度順に返す（端末・engine
+/// を知らない）。アイドル時の先読みプリレンダ（[`crate::app`]）が、ここで挙げた
+/// フレームを 1 枚ずつ事前ラスタしてキャッシュを温める。
+///
+/// 候補は来やすい順に [`Deck::advance`]・[`Deck::retreat`]・[`Deck::next_slide`]・
+/// [`Deck::prev_slide`] の 1 ホップ。`None`・`state.cur` 自身・重複は除く。
+pub fn prefetch_targets(state: &PresentState, deck: &Deck) -> Vec<FrameId> {
+    let mut out = Vec::new();
+    for cand in [
+        deck.advance(state.cur),
+        deck.retreat(state.cur),
+        deck.next_slide(state.cur),
+        deck.prev_slide(state.cur),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if cand != state.cur && !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,7 +404,7 @@ mod tests {
 
     #[test]
     fn plain_deck_advance_walks_all_pages_then_saturates() {
-        // golden_template 相当: pdfpc 無しのプレーンデッキ = 9 スライド × 1 step。
+        // 9 スライド × 1 step（overlay 無し）のデッキ。
         // 各 Advance はスライド境界跨ぎなので PresentBase（部分 overlay ではない）。
         // identity step ではフレームが進まずここで落ちる。
         let d = deck(&[1; 9]);
@@ -409,5 +433,44 @@ mod tests {
         let mut s = at(0, 0);
         let ops = step(&mut s, &d, Action::Quit);
         assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn prefetch_targets_returns_adjacent_and_neighbor_first() {
+        let d = deck(&[2, 3, 1]); // frames 0,1 | 2,3,4 | 5
+        // cur=2 (slide1 先頭): advance=3, retreat=1, next_slide=5, prev_slide=0。
+        let s = at(2, 0);
+        assert_eq!(
+            prefetch_targets(&s, &d),
+            vec![FrameId(3), FrameId(1), FrameId(5), FrameId(0)]
+        );
+    }
+
+    #[test]
+    fn prefetch_targets_excludes_out_of_range() {
+        let d = deck(&[2, 3, 1]);
+        // 先頭: retreat/prev_slide が None。
+        assert_eq!(
+            prefetch_targets(&at(0, 0), &d),
+            vec![FrameId(1), FrameId(2)]
+        );
+        // 末尾(単独スライド): advance/next_slide が None。
+        assert_eq!(
+            prefetch_targets(&at(5, 0), &d),
+            vec![FrameId(4), FrameId(2)]
+        );
+    }
+
+    #[test]
+    fn prefetch_targets_excludes_current() {
+        let d = deck(&[2, 3, 1]);
+        let s = at(3, 1);
+        assert!(!prefetch_targets(&s, &d).contains(&s.cur));
+    }
+
+    #[test]
+    fn prefetch_targets_empty_on_single_frame_deck() {
+        let d = deck(&[1]);
+        assert!(prefetch_targets(&at(0, 0), &d).is_empty());
     }
 }

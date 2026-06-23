@@ -23,6 +23,8 @@
 //!   medium（`t=d` 直送 / `t=s` 共有メモリ / `t=f` 一時ファイル）の純粋な選択と参照
 //!   wire 生成。Knightty は `t=d` のみ受理する（実測）ため [`KittyBackend`] は常に直送し、
 //!   参照 medium は確保機構を持つ将来の backend / cli 向けの建材として提供する。
+//! - [`CellSink`]: [`CellGrid`](paladocs_render::CellGrid) → ANSI テキスト出力の別出口。
+//!   画像プロトコル経路とは独立し、SGR 差分最小化・truecolor で全描画／部分更新する。
 //!
 //! # ワイヤ仕様と Knightty 実機での確定点
 //!
@@ -39,6 +41,7 @@
 
 mod backend;
 mod base64;
+mod cell_sink;
 mod encode;
 mod geometry;
 mod ids;
@@ -46,6 +49,7 @@ mod medium;
 mod presenter;
 
 pub use backend::{Backend, KittyBackend};
+pub use cell_sink::CellSink;
 pub use encode::transmit_reference;
 pub use geometry::{CellPos, CellSize, PixelOffset, Placement, Viewport, place_geometry};
 pub use ids::{IdAllocator, ImageId, PlacementId};

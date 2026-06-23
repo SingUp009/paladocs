@@ -57,51 +57,89 @@ struct PdfpcPage {
     note: Option<String>,
 }
 
-/// pdfpc メタデータから [`Deck`] を構築する。
+/// pdfpc メタデータから [`Deck`] を構築する（strict）。
 ///
-/// 戻り値:
-/// - `None`: pdfpc メタデータが見つからない（Touying 非使用など）→ 呼び出し側で
-///   フォールバックへ。
-/// - `Some(Ok(deck))`: 構築成功（[`Deck::validate`] 済み）。
-/// - `Some(Err(e))`: メタデータはあるが解釈に失敗（スキーマ不整合など）。
-pub(crate) fn pdfpc_deck(doc: &PagedDocument, meta: DeckMeta) -> Option<Result<Deck, EngineError>> {
+/// 構造抽出は pdfpc を必須とし、無音フォールバックしない（ブリーフ §A）:
+/// - `<pdfpc-file>` メタ不在 → [`EngineError::PdfpcMissing`]。
+/// - `pdfpcFormat != 2`・`pages` 不正・必須キー欠落・型不一致 →
+///   [`EngineError::PdfpcSchema`]。
+/// - 成功 → [`Deck::validate`] 済みの [`Deck`]。
+pub(crate) fn pdfpc_deck(doc: &PagedDocument, meta: DeckMeta) -> Result<Deck, EngineError> {
     let pages = read_pages(doc)?;
-    Some(build(&pages, meta))
+    build(&pages, meta)
 }
 
-/// `<pdfpc-file>` メタデータを読み、`pages` 配列をパースする。
+/// スキーマ不整合エラーを作る小ヘルパ。
+fn schema(msg: impl Into<String>) -> EngineError {
+    EngineError::PdfpcSchema(msg.into())
+}
+
+/// `<pdfpc-file>` メタデータを読み、`pages` 配列をパースする（strict）。
 ///
-/// メタデータが存在しない、または `pages` を辞書配列として取り出せない場合は
-/// `None`（→ フォールバック）。個々のページに必須キー（`idx`/`label`）が欠ける
-/// 場合も `None` を返す。
-fn read_pages(doc: &PagedDocument) -> Option<Vec<PdfpcPage>> {
-    let label = Label::new(PicoStr::intern(PDFPC_LABEL))?;
-    let content = doc.introspector().query_label(label).ok()?;
-    let value = &content.to_packed::<MetadataElem>()?.value;
+/// - メタが見つからない → [`EngineError::PdfpcMissing`]。
+/// - 値が辞書でない・`pdfpcFormat != 2`・`pages` が辞書配列でない・各ページの
+///   必須キー（`idx`/`label`）欠落や型不一致 → [`EngineError::PdfpcSchema`]。
+fn read_pages(doc: &PagedDocument) -> Result<Vec<PdfpcPage>, EngineError> {
+    let label = Label::new(PicoStr::intern(PDFPC_LABEL))
+        .ok_or_else(|| schema("internal: invalid pdfpc label"))?;
+    // ラベル未解決 = pdfpc 無効（Touying 非使用など）→ Missing。
+    let content = doc
+        .introspector()
+        .query_label(label)
+        .map_err(|_| EngineError::PdfpcMissing)?;
+    let value = &content
+        .to_packed::<MetadataElem>()
+        .ok_or_else(|| schema("<pdfpc-file> is not a metadata element"))?
+        .value;
 
     let Value::Dict(dict) = value else {
-        return None;
+        return Err(schema("pdfpc value is not a dictionary"));
     };
-    let Value::Array(arr) = dict.get("pages").ok()? else {
-        return None;
+
+    // pdfpcFormat はバージョン固定（v2 のみ対応）。記憶で決め打ちせず明示検査する。
+    let format = dict
+        .get("pdfpcFormat")
+        .map_err(|_| schema("missing pdfpcFormat"))?;
+    match as_int(format) {
+        Some(2) => {}
+        other => {
+            return Err(schema(format!(
+                "unsupported pdfpcFormat: expected 2, got {other:?}"
+            )));
+        }
+    }
+
+    let Value::Array(arr) = dict
+        .get("pages")
+        .map_err(|_| schema("missing pages array"))?
+    else {
+        return Err(schema("pages is not an array"));
     };
 
     let mut out = Vec::with_capacity(arr.len());
     for item in arr.iter() {
         let Value::Dict(page) = item else {
-            return None;
+            return Err(schema("page entry is not a dictionary"));
         };
-        let idx = as_int(page.get("idx").ok()?)?;
+        let idx = page
+            .get("idx")
+            .ok()
+            .and_then(as_int)
+            .ok_or_else(|| schema("page missing integer idx"))?;
         // 実測: `label` は整数ではなく文字列（"1", "2", ...）。
-        let label = as_str(page.get("label").ok()?)?;
+        let label = page
+            .get("label")
+            .ok()
+            .and_then(as_str)
+            .ok_or_else(|| schema("page missing string label"))?;
         let note = page.get("note").ok().and_then(as_str);
         out.push(PdfpcPage {
-            idx: u32::try_from(idx).ok()?,
+            idx: u32::try_from(idx).map_err(|_| schema("page idx out of range"))?,
             label,
             note,
         });
     }
-    Some(out)
+    Ok(out)
 }
 
 /// 連続する同一 `label` のページを 1 スライドにまとめ、各ページを step にする。
