@@ -58,14 +58,18 @@ impl<B: Backend> Presenter<B> {
     /// `fit(base.image.size(), viewport)` で配置矩形を決め、新 image を `transmit`
     /// → そのアンカーに `z=0` で `place`。状態を記録する。
     pub fn present_slide(&mut self, sink: &mut dyn Write, base: &Frame) -> io::Result<()> {
-        if self.slide.is_some() {
-            self.clear_slide(sink)?;
-        }
         let base_rect = fit(base.image.size(), self.viewport.pixel_size());
         let image = self.ids.next_image();
+        // 新 base を先に転送する（重い）。転送中も旧スライドを画面に残すことで、
+        // delete→transmit の順で生じる「転送時間ぶんの空白フレーム」を防ぐ。
         self.backend.transmit(sink, image, &base.image)?;
         let (cell, offset) = place_geometry(base_rect.x, base_rect.y, self.viewport.cell)
             .ok_or_else(invalid_geometry)?;
+        // 転送完了後に旧スライドをハード削除し、ただちに新 base を配置する。
+        // 削除と配置は軽量シーケンスで同一 flush にまとまるため空白窓はほぼ無い。
+        if self.slide.is_some() {
+            self.clear_slide(sink)?;
+        }
         let pid = self.ids.next_placement();
         self.backend.place(
             sink,
@@ -167,17 +171,17 @@ impl<B: Backend> Presenter<B> {
 
     /// viewport を更新し、新解像度で base を再提示する。
     ///
-    /// 現在スライドをハードクリアしてから新 `viewport` で `present_slide` する。
-    /// `base` は `cli` が新解像度で再ラスタしたものを渡す。オーバーレイは `cli` が
-    /// 続けて [`apply_overlay`](Self::apply_overlay) で再適用する（term は overlay
-    /// 列の内容を保持しない）。
+    /// 新 `viewport` を設定してから [`present_slide`](Self::present_slide) する。
+    /// 旧スライドのハードクリアは `present_slide` が新 base 転送後に行うため、
+    /// 転送中の空白フレームが出ない。`base` は `cli` が新解像度で再ラスタしたものを
+    /// 渡す。オーバーレイは `cli` が続けて [`apply_overlay`](Self::apply_overlay) で
+    /// 再適用する（term は overlay 列の内容を保持しない）。
     pub fn resize(
         &mut self,
         sink: &mut dyn Write,
         viewport: Viewport,
         base: &Frame,
     ) -> io::Result<()> {
-        self.clear_slide(sink)?;
         self.viewport = viewport;
         self.present_slide(sink, base)
     }
@@ -298,6 +302,33 @@ mod tests {
                     z: 0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn present_transmits_new_before_deleting_old_to_avoid_blank() {
+        // 空白フレーム回避の不変条件: スライド境界跨ぎでは、新 base を transmit して
+        // から旧スライドをハード削除する。delete→transmit の順だと重い転送中ずっと
+        // 画面が空になりちらつく。
+        let mut p = Presenter::new(Recorder::default(), viewport());
+        let mut sink = Vec::new();
+        let base1 = solid(600, 480, [10, 20, 30, 255], 0);
+        p.present_slide(&mut sink, &base1).unwrap();
+        let base2 = solid(600, 480, [40, 50, 60, 255], 1);
+        p.present_slide(&mut sink, &base2).unwrap();
+
+        let ev = &p.backend().events;
+        let transmit_new = ev
+            .iter()
+            .position(|e| matches!(e, Ev::Transmit { id: 2, .. }))
+            .expect("new base transmitted");
+        let delete_old = ev
+            .iter()
+            .position(|e| matches!(e, Ev::DeleteImage { image: 1 }))
+            .expect("old base deleted");
+        assert!(
+            transmit_new < delete_old,
+            "new base must be transmitted before the old image is hard-deleted"
         );
     }
 

@@ -3,6 +3,34 @@
 
 use std::path::PathBuf;
 
+/// 出口レンダラの選択（`--mode`）。
+///
+/// 解決は起動時 1 回だけ行う（[`crate::mode::resolve_mode`]）。`Auto` は画像対応端末
+/// （Knightty 等）前提で image を選ぶ。cell-mode（ANSI セル＝MDPT 表示）を出すには
+/// `--mode cell` で明示強制する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// 既定。画像プロトコル経路を選ぶ。
+    #[default]
+    Auto,
+    /// 画像プロトコル経路を強制する。
+    Image,
+    /// cell-mode（ANSI セル）を強制する。
+    Cell,
+}
+
+impl Mode {
+    /// `auto` / `image` / `cell`（小文字）を [`Mode`] へ。未知値は `None`。
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "image" => Some(Self::Image),
+            "cell" => Some(Self::Cell),
+            _ => None,
+        }
+    }
+}
+
 /// 解析済みサブコマンド。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -10,6 +38,8 @@ pub enum Command {
     Present {
         /// entrypoint の `.typ`。
         root: PathBuf,
+        /// 出口レンダラ選択。
+        mode: Mode,
     },
     /// プレビュー。キー入力で操作し、`--control` 指定時は Neovim 契約の制御 socket
     /// からもコマンドを受ける（socket は任意）。
@@ -18,6 +48,8 @@ pub enum Command {
         root: PathBuf,
         /// 制御 socket のパス（省略可。無ければキー入力のみ）。
         control: Option<PathBuf>,
+        /// 出口レンダラ選択。
+        mode: Mode,
     },
     /// PDF 書き出し（対話なし）。
     Build {
@@ -33,8 +65,8 @@ pub const USAGE: &str = "\
 paladocs — Typst presenter
 
 USAGE:
-    paladocs present <ROOT.typ>
-    paladocs preview <ROOT.typ> [--control <SOCKET>]
+    paladocs present <ROOT.typ> [--mode auto|image|cell]
+    paladocs preview <ROOT.typ> [--control <SOCKET>] [--mode auto|image|cell]
     paladocs build   <ROOT.typ> -o <OUT.pdf>";
 
 /// プログラム名を除いた引数列 `args` を [`Command`] へ解析する。
@@ -45,20 +77,33 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let sub = it.next().ok_or_else(|| "missing subcommand".to_string())?;
     match sub.as_str() {
         "present" => {
-            let root = positional(it.next(), "ROOT.typ")?;
-            if let Some(extra) = it.next() {
-                return Err(format!("unexpected extra argument: {extra}"));
+            let mut root: Option<PathBuf> = None;
+            let mut mode: Option<Mode> = None;
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--mode" => set_mode_once(&mut mode, it.next())?,
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown flag: {other}"));
+                    }
+                    _ => set_once(&mut root, arg, "ROOT.typ")?,
+                }
             }
-            Ok(Command::Present { root })
+            let root = root.ok_or_else(|| "present: missing ROOT.typ".to_string())?;
+            Ok(Command::Present {
+                root,
+                mode: mode.unwrap_or_default(),
+            })
         }
         "preview" => {
             let mut root: Option<PathBuf> = None;
             let mut control: Option<PathBuf> = None;
+            let mut mode: Option<Mode> = None;
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     "--control" => {
                         control = Some(positional(it.next(), "SOCKET")?);
                     }
+                    "--mode" => set_mode_once(&mut mode, it.next())?,
                     other if other.starts_with('-') => {
                         return Err(format!("unknown flag: {other}"));
                     }
@@ -66,7 +111,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 }
             }
             let root = root.ok_or_else(|| "preview: missing ROOT.typ".to_string())?;
-            Ok(Command::Preview { root, control })
+            Ok(Command::Preview {
+                root,
+                control,
+                mode: mode.unwrap_or_default(),
+            })
         }
         "build" => {
             let mut root: Option<PathBuf> = None;
@@ -106,6 +155,17 @@ fn set_once(slot: &mut Option<PathBuf>, arg: &str, name: &str) -> Result<(), Str
     Ok(())
 }
 
+/// `--mode <value>` を 1 度だけ解析する。値欠落・未知値・重複はエラー。
+fn set_mode_once(slot: &mut Option<Mode>, value: Option<&String>) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("--mode specified more than once".to_string());
+    }
+    let value = value.ok_or_else(|| "--mode requires a value (auto|image|cell)".to_string())?;
+    let mode = Mode::parse(value).ok_or_else(|| format!("unknown --mode value: {value}"))?;
+    *slot = Some(mode);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +179,8 @@ mod tests {
         assert_eq!(
             parse_args(&argv(&["present", "deck.typ"])),
             Ok(Command::Present {
-                root: PathBuf::from("deck.typ")
+                root: PathBuf::from("deck.typ"),
+                mode: Mode::Auto,
             })
         );
     }
@@ -131,6 +192,7 @@ mod tests {
             Ok(Command::Preview {
                 root: PathBuf::from("deck.typ"),
                 control: Some(PathBuf::from("/tmp/p.sock")),
+                mode: Mode::Auto,
             })
         );
     }
@@ -142,7 +204,83 @@ mod tests {
             Ok(Command::Preview {
                 root: PathBuf::from("deck.typ"),
                 control: Some(PathBuf::from("s.sock")),
+                mode: Mode::Auto,
             })
+        );
+    }
+
+    #[test]
+    fn parse_present_mode_values() {
+        for (arg, want) in [
+            ("auto", Mode::Auto),
+            ("image", Mode::Image),
+            ("cell", Mode::Cell),
+        ] {
+            assert_eq!(
+                parse_args(&argv(&["present", "deck.typ", "--mode", arg])),
+                Ok(Command::Present {
+                    root: PathBuf::from("deck.typ"),
+                    mode: want,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn parse_present_mode_before_root() {
+        assert_eq!(
+            parse_args(&argv(&["present", "--mode", "cell", "deck.typ"])),
+            Ok(Command::Present {
+                root: PathBuf::from("deck.typ"),
+                mode: Mode::Cell,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_preview_with_mode() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "preview",
+                "deck.typ",
+                "--control",
+                "s.sock",
+                "--mode",
+                "cell",
+            ])),
+            Ok(Command::Preview {
+                root: PathBuf::from("deck.typ"),
+                control: Some(PathBuf::from("s.sock")),
+                mode: Mode::Cell,
+            })
+        );
+    }
+
+    #[test]
+    fn present_mode_default_is_auto() {
+        let Ok(Command::Present { mode, .. }) = parse_args(&argv(&["present", "deck.typ"])) else {
+            panic!("expected Present");
+        };
+        assert_eq!(mode, Mode::Auto);
+    }
+
+    #[test]
+    fn unknown_mode_value_errors() {
+        assert!(parse_args(&argv(&["present", "deck.typ", "--mode", "ascii"])).is_err());
+    }
+
+    #[test]
+    fn mode_missing_value_errors() {
+        assert!(parse_args(&argv(&["present", "deck.typ", "--mode"])).is_err());
+    }
+
+    #[test]
+    fn mode_specified_twice_errors() {
+        assert!(
+            parse_args(&argv(&[
+                "present", "deck.typ", "--mode", "cell", "--mode", "image",
+            ]))
+            .is_err()
         );
     }
 
@@ -165,6 +303,7 @@ mod tests {
             Ok(Command::Preview {
                 root: PathBuf::from("deck.typ"),
                 control: None,
+                mode: Mode::Auto,
             })
         );
     }

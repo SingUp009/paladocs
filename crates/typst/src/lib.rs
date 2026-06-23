@@ -6,15 +6,15 @@
 //! ストレートアルファ）として描画し、PDF を出力し、reload（再コンパイル）と
 //! 診断マッピングを提供する。
 //!
-//! 中心となる型は [`Engine`]。同一コンパイル結果（`PagedDocument`）から Deck・
-//! Frame・PDF をすべて派生させる。
+//! 中心となる型は [`CompiledDeck`]。[`compile_deck`] が `World` を 1 度コンパイル
+//! して返し、同一コンパイル結果（`PagedDocument`）から Deck・Frame・PDF・
+//! [`render_step`]（ページ→セル投影）をすべて派生させる。
 //!
 //! # 正準形式
 //!
 //! Typst（tiny-skia `Pixmap`）の出力は**プリマルチプライド**アルファである。
-//! 本クレートは [`render_frame`](Engine::render_frame) 等で必ず**アンプリマルチ
-//! プライ**して [`paladocs_render`] の正準形式（RGBA8・ストレートアルファ）へ
-//! 変換してから返す。
+//! 本クレートは [`CompiledDeck::render_frame`] 等で必ず**アンプリマルチプライ**して
+//! [`paladocs_render`] の正準形式（RGBA8・ストレートアルファ）へ変換してから返す。
 //!
 //! # Deck の不変条件
 //!
@@ -22,12 +22,15 @@
 //! [`Deck::validate`](paladocs_core::Deck::validate) を通す。違反は
 //! [`EngineError`] に変換される。
 
+mod compiled;
 mod convert;
 mod deck;
 mod diag;
-mod engine;
 mod pdfpc;
+mod project;
 mod world;
 
+pub use compiled::{CompiledDeck, compile_deck};
 pub use diag::{Diagnostic, EngineError, Severity};
-pub use engine::Engine;
+pub use project::{RenderOpts, render_step};
+pub use world::PaladocsWorld;

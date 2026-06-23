@@ -23,9 +23,12 @@
 //! - `build <ROOT.typ> -o <OUT.pdf>` — PDF 書き出し（対話なし）。
 
 pub mod app;
+mod cache;
 pub mod cli;
 pub mod diag;
 mod error;
+pub mod letterbox;
+pub mod mode;
 pub mod nav;
 pub mod pdf;
 pub mod protocol;
@@ -39,8 +42,12 @@ pub use error::CliError;
 pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     let command = cli::parse_args(args).map_err(CliError::Usage)?;
     match command {
-        Command::Present { root } => app::run_present(&root),
-        Command::Preview { root, control } => app::run_preview(&root, control.as_deref()),
+        Command::Present { root, mode } => app::run_present(&root, mode),
+        Command::Preview {
+            root,
+            control,
+            mode,
+        } => app::run_preview(&root, control.as_deref(), mode),
         Command::Build { root, out } => pdf::run_build(&root, &out),
     }
 }

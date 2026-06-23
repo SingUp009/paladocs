@@ -31,6 +31,9 @@
 use paladocs_core::{FrameId, SizePt};
 use std::fmt;
 
+mod cell;
+pub use cell::*;
+
 /// pixel 単位の 2D サイズ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelSize {

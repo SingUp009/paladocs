@@ -48,6 +48,14 @@ pub enum EngineError {
     Io(String),
     /// パッケージ解決/取得失敗。
     Package(String),
+    /// Touying の pdfpc メタデータ（`<pdfpc-file>`）が見つからない。
+    ///
+    /// 構造抽出は pdfpc を必須とし、無音フォールバックしない（ブリーフ §A）。
+    /// デッキ側で `enable-pdfpc: true` を有効化する必要がある。
+    PdfpcMissing,
+    /// pdfpc メタデータはあるが解釈できない（`pdfpcFormat != 2`・必須キー欠落・
+    /// 型不一致など）。記憶での決め打ちを避け、不整合は明示エラーにする。
+    PdfpcSchema(String),
 }
 
 impl fmt::Display for EngineError {
@@ -63,6 +71,10 @@ impl fmt::Display for EngineError {
             Self::Render(msg) => write!(f, "render error: {msg}"),
             Self::Io(msg) => write!(f, "io error: {msg}"),
             Self::Package(msg) => write!(f, "package error: {msg}"),
+            Self::PdfpcMissing => {
+                write!(f, "deck must enable Touying pdfpc (enable-pdfpc: true)")
+            }
+            Self::PdfpcSchema(msg) => write!(f, "pdfpc metadata error: {msg}"),
         }
     }
 }

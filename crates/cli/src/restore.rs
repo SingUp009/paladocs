@@ -7,10 +7,13 @@
 //! 1. 全画像をハード削除（Kitty `a=d,d=A`。配置と画像データを解放）。
 //! 2. カーソル表示（`CSI ?25h`）。
 //! 3. alt-screen 退出（`CSI ?1049l`）。
-//! 4. raw mode 解除（[`crossterm::terminal::disable_raw_mode`]、実端末のみ）。
+//! 4. SGR リセット（`CSI 0 m`。cell-mode の `CellSink::leave` 相当。画像モードでも無害）。
+//! 5. raw mode 解除（[`crossterm::terminal::disable_raw_mode`]、実端末のみ）。
 //!
-//! [`restore_sequence`] は 1〜3 を sink へ書く純関数で単体テストできる。raw 解除は
-//! プロセス全体の状態なので [`RawGuard`] が drop 時に行う。
+//! [`restore_sequence`] は 1〜4 を sink へ書く純関数で単体テストできる。raw 解除は
+//! プロセス全体の状態なので [`RawGuard`] が drop 時に行う。cell-mode の出口
+//! （SGR リセット）も本経路に同梱することで、image/cell の別なく panic/signal 含め
+//! enter→leave が単一経路で保証される。
 
 use std::io::{self, Write};
 
@@ -25,6 +28,8 @@ pub fn restore_sequence(sink: &mut dyn Write) -> io::Result<()> {
     sink.write_all(b"\x1b[?25h")?;
     // 3. alt-screen 退出。
     sink.write_all(b"\x1b[?1049l")?;
+    // 4. SGR リセット（cell-mode の leave 相当。画像モードでも無害）。
+    sink.write_all(b"\x1b[0m")?;
     sink.flush()
 }
 
@@ -92,7 +97,11 @@ mod tests {
         let del = s.find("\x1b_Ga=d,d=A").expect("delete-all images");
         let cursor = s.find("\x1b[?25h").expect("show cursor");
         let alt = s.find("\x1b[?1049l").expect("leave alt-screen");
-        assert!(del < cursor && cursor < alt, "wrong order: {s:?}");
+        let sgr = s.find("\x1b[0m").expect("SGR reset");
+        assert!(
+            del < cursor && cursor < alt && alt < sgr,
+            "wrong order: {s:?}"
+        );
     }
 
     #[test]
@@ -107,5 +116,6 @@ mod tests {
         assert!(s.contains("\x1b_Ga=d,d=A"));
         assert!(s.contains("\x1b[?25h"));
         assert!(s.contains("\x1b[?1049l"));
+        assert!(s.contains("\x1b[0m")); // cell-mode leave 相当の SGR リセット。
     }
 }
