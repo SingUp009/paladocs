@@ -1,0 +1,31 @@
+[package]
+name = "paladocs-cli"
+version = "0.1.0"
+description = "Presenter CLI for Paladocs: wires the typst engine, render diff, and Kitty-protocol term driver into a running presenter. Owns the terminal (raw/alt-screen/resize/restore), multiplexes key/socket/resize input into a navigation state machine, and exports PDF."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "paladocs_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "paladocs"
+path = "src/main.rs"
+
+[dependencies]
+paladocs-core = { path = "../core" }
+paladocs-render = { path = "../render" }
+paladocs-typst = { path = "../typst" }
+paladocs-term = { path = "../term" }
+
+# cli-only: terminal ownership and robust incoming JSON. These deps are
+# confined to `cli` and must not leak into core/render/typst/term.
+crossterm = "0.29"
+serde_json = "1"
+
+[dev-dependencies]
+# Integration tests name FrameId directly when asserting socket → Action.
+paladocs-core = { path = "../core" }

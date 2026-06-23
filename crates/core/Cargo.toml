@@ -1,0 +1,10 @@
+[package]
+name = "paladocs-core"
+version = "0.1.0"
+description = "Logical IR for Paladocs slide decks. Resolution-independent, I/O-free, no rendering types."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

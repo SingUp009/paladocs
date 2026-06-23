@@ -1,0 +1,11 @@
+[package]
+name = "paladocs-render"
+version = "0.1.0"
+description = "Resolution-bearing pixel & geometry primitives for Paladocs: canonical RGBA, raster-diff, alpha compositing, letterbox. I/O-free."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paladocs-core = { path = "../core" }

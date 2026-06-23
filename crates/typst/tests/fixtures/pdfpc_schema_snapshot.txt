@@ -1,0 +1,29 @@
+(
+  pdfpcFormat: 2,
+  disableMarkdown: false,
+  pages: (
+    (
+      idx: 0,
+      label: "1",
+      overlay: 0,
+      forcedOverlay: false,
+      hidden: false,
+      note: "Note for the first slide.",
+    ),
+    (
+      idx: 1,
+      label: "1",
+      overlay: 1,
+      forcedOverlay: true,
+      hidden: false,
+      note: "Note for the first slide.",
+    ),
+    (
+      idx: 2,
+      label: "2",
+      overlay: 0,
+      forcedOverlay: false,
+      hidden: false,
+    ),
+  ),
+)

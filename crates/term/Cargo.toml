@@ -1,0 +1,10 @@
+[package]
+name = "paladocs-term"
+version = "0.1.0"
+description = "Stateful Kitty graphics protocol driver for Paladocs: transmits render::Frame/Layer to a Kitty-class terminal (Knightty) and manages image/placement lifecycle with z-overlay partial updates. Writes bytes to an abstract sink; owns no terminal."
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+paladocs-core = { path = "../core" }
+paladocs-render = { path = "../render" }

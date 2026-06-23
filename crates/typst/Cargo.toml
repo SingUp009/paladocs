@@ -1,0 +1,35 @@
+[package]
+name = "paladocs-typst"
+version = "0.1.0"
+description = "Typst compilation engine for Paladocs: compiles Typst sources into a logical Deck, renders pages to canonical RGBA frames, and exports PDF. Isolates all heavy external dependencies."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paladocs-core = { path = "../core" }
+paladocs-render = { path = "../render" }
+
+# Typst compiler group — kept in lockstep at the same minor version (0.15).
+typst = "=0.15.0"
+typst-layout = "=0.15.0"
+typst-render = "=0.15.0"
+typst-pdf = "=0.15.0"
+typst-kit = { version = "=0.15.0", default-features = false, features = [
+    "embedded-fonts",
+    "scan-fonts",
+    "system-files",
+    "universe-packages",
+    "system-downloader",
+] }
+typst-assets = { version = "=0.15.0", features = ["fonts"] }
+comemo = "0.4"
+# Must match the tiny-skia version used by typst-render 0.15 (0.12) so that the
+# `Pixmap` type returned by `typst_render::render` unifies with ours.
+tiny-skia = "0.12"
+
+[features]
+# Tests that require fetching the Touying package over the network (or a warm
+# package cache). Off by default so `cargo test` stays hermetic.
+touying-tests = []
