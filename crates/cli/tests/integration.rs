@@ -42,11 +42,11 @@ fn control_socket_roundtrip() {
 
     // クライアント側: Neovim 契約のコマンド列（途中に不正行を混ぜる）。
     let mut client = UnixStream::connect(&path).unwrap();
-    writeln!(client, "{}", r#"{"cmd":"next"}"#).unwrap();
+    writeln!(client, r#"{{"cmd":"next"}}"#).unwrap();
     writeln!(client, "this is not json").unwrap();
-    writeln!(client, "{}", r#"{"cmd":"goto","frame":3}"#).unwrap();
-    writeln!(client, "{}", r#"{"cmd":"reload"}"#).unwrap();
-    writeln!(client, "{}", r#"{"cmd":"quit"}"#).unwrap();
+    writeln!(client, r#"{{"cmd":"goto","frame":3}}"#).unwrap();
+    writeln!(client, r#"{{"cmd":"reload"}}"#).unwrap();
+    writeln!(client, r#"{{"cmd":"quit"}}"#).unwrap();
     drop(client);
 
     let actions = server.join().unwrap();
