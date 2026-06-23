@@ -178,9 +178,9 @@ pub fn run_present(root: &Path) -> Result<(), CliError> {
     run(root, None)
 }
 
-/// `preview`: 制御 socket（Neovim 契約）+ キー入力。
-pub fn run_preview(root: &Path, control: &Path) -> Result<(), CliError> {
-    run(root, Some(control))
+/// `preview`: キー入力。`control` が `Some` なら制御 socket（Neovim 契約）も併用。
+pub fn run_preview(root: &Path, control: Option<&Path>) -> Result<(), CliError> {
+    run(root, control)
 }
 
 /// プレゼンタ本体。`present` と `preview` は入力源が違うだけで共有する。

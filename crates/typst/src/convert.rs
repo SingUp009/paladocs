@@ -32,22 +32,11 @@ pub(crate) fn pixmap_to_rgba(pixmap: &Pixmap) -> Result<Rgba, EngineError> {
 
 /// ページ（pt）を pixel ビューポートにアスペクト保持で収めるときの ppp を返す。
 ///
-/// `paladocs_render::fit` でビューポート内の充填矩形を求め、`ppp = fit.w /
-/// page_pt.w` とする。`page_pt` の幅または高さが非正のときはゼロ除算を避けて
-/// `1.0` を返す。返り値は常に正。
+/// スケール決定は純粋層の [`paladocs_render::scale_for`] に委譲する（ppp ==
+/// pixels-per-point）。`render` 側が `fit` でビューポート内の充填矩形を求め
+/// `ppp = fit.w / page_pt.w` を返す。非正のページサイズ・空ビューポートでは `1.0`。
 pub(crate) fn ppp_for_fit(page_pt: SizePt, viewport: PixelSize) -> f32 {
-    if page_pt.w <= 0.0 || page_pt.h <= 0.0 {
-        return 1.0;
-    }
-    let content = PixelSize {
-        w: (page_pt.w.round() as u32).max(1),
-        h: (page_pt.h.round() as u32).max(1),
-    };
-    let rect = paladocs_render::fit(content, viewport);
-    if rect.w == 0 {
-        return 1.0;
-    }
-    rect.w as f32 / page_pt.w
+    paladocs_render::scale_for(page_pt, viewport)
 }
 
 #[cfg(test)]

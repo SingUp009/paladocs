@@ -58,9 +58,15 @@ fn compile_single_page_and_validate() {
 fn compile_multi_page() {
     let project = TempProject::new("First\n#pagebreak()\nSecond\n#pagebreak()\nThird");
     let engine = Engine::compile(&project.root()).unwrap();
-    assert_eq!(engine.deck().frame_count(), 3);
-    // フォールバックでは各ページが 1-step スライド。
-    assert_eq!(engine.deck().slides.len(), 3);
+    let deck = engine.deck();
+    assert_eq!(deck.frame_count(), 3);
+    // pdfpc メタの無いプレーンデッキ: N ページ → N スライド、各スライド 1 step。
+    // 空 Deck / 1 スライド固定の no-op フォールバックではここで落ちる。
+    assert_eq!(deck.slides.len(), 3);
+    for (i, slide) in deck.slides.iter().enumerate() {
+        assert_eq!(slide.steps.len(), 1, "slide {i} must have exactly one step");
+        assert_eq!(slide.steps[0].frame, FrameId(i as u32));
+    }
 }
 
 #[test]

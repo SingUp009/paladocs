@@ -11,12 +11,13 @@ pub enum Command {
         /// entrypoint の `.typ`。
         root: PathBuf,
     },
-    /// Neovim 契約。制御 socket からコマンド受信（キーも併用）。
+    /// プレビュー。キー入力で操作し、`--control` 指定時は Neovim 契約の制御 socket
+    /// からもコマンドを受ける（socket は任意）。
     Preview {
         /// entrypoint の `.typ`。
         root: PathBuf,
-        /// 制御 socket のパス。
-        control: PathBuf,
+        /// 制御 socket のパス（省略可。無ければキー入力のみ）。
+        control: Option<PathBuf>,
     },
     /// PDF 書き出し（対話なし）。
     Build {
@@ -33,7 +34,7 @@ paladocs — Typst presenter
 
 USAGE:
     paladocs present <ROOT.typ>
-    paladocs preview <ROOT.typ> --control <SOCKET>
+    paladocs preview <ROOT.typ> [--control <SOCKET>]
     paladocs build   <ROOT.typ> -o <OUT.pdf>";
 
 /// プログラム名を除いた引数列 `args` を [`Command`] へ解析する。
@@ -65,8 +66,6 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 }
             }
             let root = root.ok_or_else(|| "preview: missing ROOT.typ".to_string())?;
-            let control =
-                control.ok_or_else(|| "preview: missing --control <SOCKET>".to_string())?;
             Ok(Command::Preview { root, control })
         }
         "build" => {
@@ -131,7 +130,7 @@ mod tests {
             parse_args(&argv(&["preview", "deck.typ", "--control", "/tmp/p.sock"])),
             Ok(Command::Preview {
                 root: PathBuf::from("deck.typ"),
-                control: PathBuf::from("/tmp/p.sock"),
+                control: Some(PathBuf::from("/tmp/p.sock")),
             })
         );
     }
@@ -142,7 +141,7 @@ mod tests {
             parse_args(&argv(&["preview", "--control", "s.sock", "deck.typ"])),
             Ok(Command::Preview {
                 root: PathBuf::from("deck.typ"),
-                control: PathBuf::from("s.sock"),
+                control: Some(PathBuf::from("s.sock")),
             })
         );
     }
@@ -159,8 +158,15 @@ mod tests {
     }
 
     #[test]
-    fn preview_missing_control_errors() {
-        assert!(parse_args(&argv(&["preview", "deck.typ"])).is_err());
+    fn parse_preview_without_control_is_keyboard_only() {
+        // socket は任意: `preview <file>` はキー入力のみのプレビュー。
+        assert_eq!(
+            parse_args(&argv(&["preview", "deck.typ"])),
+            Ok(Command::Preview {
+                root: PathBuf::from("deck.typ"),
+                control: None,
+            })
+        );
     }
 
     #[test]

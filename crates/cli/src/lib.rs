@@ -40,7 +40,7 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     let command = cli::parse_args(args).map_err(CliError::Usage)?;
     match command {
         Command::Present { root } => app::run_present(&root),
-        Command::Preview { root, control } => app::run_preview(&root, &control),
+        Command::Preview { root, control } => app::run_preview(&root, control.as_deref()),
         Command::Build { root, out } => pdf::run_build(&root, &out),
     }
 }

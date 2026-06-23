@@ -19,6 +19,10 @@
 //!   ライフサイクル。画像/placement を確実に解放しリークさせない。
 //! - [`place_geometry`]: pixel 矩形原点 → アンカーセル + セル内オフセットの純粋写像
 //!   （cell マッピングは term の責務）。
+//! - [`select_medium`] / [`Capability`] / [`Medium`] / [`transmit_reference`]: 送出
+//!   medium（`t=d` 直送 / `t=s` 共有メモリ / `t=f` 一時ファイル）の純粋な選択と参照
+//!   wire 生成。Knightty は `t=d` のみ受理する（実測）ため [`KittyBackend`] は常に直送し、
+//!   参照 medium は確保機構を持つ将来の backend / cli 向けの建材として提供する。
 //!
 //! # ワイヤ仕様と Knightty 実機での確定点
 //!
@@ -38,9 +42,12 @@ mod base64;
 mod encode;
 mod geometry;
 mod ids;
+mod medium;
 mod presenter;
 
 pub use backend::{Backend, KittyBackend};
+pub use encode::transmit_reference;
 pub use geometry::{CellPos, CellSize, PixelOffset, Placement, Viewport, place_geometry};
 pub use ids::{IdAllocator, ImageId, PlacementId};
+pub use medium::{Capability, DIRECT_MAX_PAYLOAD_BYTES, Medium, select_medium};
 pub use presenter::Presenter;

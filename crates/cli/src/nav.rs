@@ -379,6 +379,31 @@ mod tests {
     }
 
     #[test]
+    fn plain_deck_advance_walks_all_pages_then_saturates() {
+        // golden_template 相当: pdfpc 無しのプレーンデッキ = 9 スライド × 1 step。
+        // 各 Advance はスライド境界跨ぎなので PresentBase（部分 overlay ではない）。
+        // identity step ではフレームが進まずここで落ちる。
+        let d = deck(&[1; 9]);
+        let mut s = PresentState::start();
+        for next in 1..=8u32 {
+            let ops = step(&mut s, &d, Action::Advance);
+            assert_eq!(ops, vec![RenderOp::PresentBase(FrameId(next))]);
+            assert_eq!(s, at(next, 0));
+        }
+        // 最終フレーム(8)から先は飽和（Noop、状態不変）。
+        let ops = step(&mut s, &d, Action::Advance);
+        assert_eq!(ops, vec![RenderOp::Noop]);
+        assert_eq!(s, at(8, 0));
+        // 逆送りで先頭まで戻れる。
+        for prev in (0..=7u32).rev() {
+            let ops = step(&mut s, &d, Action::Retreat);
+            assert_eq!(ops, vec![RenderOp::PresentBase(FrameId(prev))]);
+        }
+        assert_eq!(step(&mut s, &d, Action::Retreat), vec![RenderOp::Noop]);
+        assert_eq!(s, at(0, 0));
+    }
+
+    #[test]
     fn quit_returns_no_ops() {
         let d = deck(&[2, 3, 1]);
         let mut s = at(0, 0);

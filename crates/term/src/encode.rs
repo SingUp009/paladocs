@@ -15,6 +15,7 @@
 //! - 応答ノイズを避けるため全コマンドに `q=1`（成功 OK を抑制・エラーは残す）。
 
 use crate::geometry::Placement;
+use crate::medium::Medium;
 use std::io::{self, Write};
 
 /// 1 チャンクあたりの base64 最大バイト数（Knightty / Kitty 仕様）。
@@ -67,6 +68,29 @@ pub fn transmit(
         }
     }
     Ok(())
+}
+
+/// 参照 medium（`t=s` 共有メモリ / `t=f` 一時ファイル）で画像を送信する。
+///
+/// `reference` は共有メモリ名（`t=s`）または一時ファイルパス（`t=f`）のバイト列で、
+/// base64 化してペイロードに載せる（参照は短いので単一 APC）。`f=32`・`s=`/`v=`・
+/// `i=`・`t=<medium>`・`q=1`・`m=0` を付ける。
+///
+/// **参照オブジェクトの確保は呼び出し側の責務**（term は I/O を持たない）。画素を
+/// 直送する場合は [`Backend::transmit`](crate::Backend::transmit)（`t=d`）を使うこと。
+/// 本関数は `t=d` フォールバックを持たず、与えられた `medium` の `t=` を素直に書く。
+pub fn transmit_reference(
+    sink: &mut dyn Write,
+    image: u32,
+    width: u32,
+    height: u32,
+    medium: Medium,
+    reference: &[u8],
+) -> io::Result<()> {
+    let b64 = crate::base64::encode(reference);
+    let t = medium.wire_key();
+    let keys = format!("a=t,f=32,s={width},v={height},i={image},t={t},q=1,m=0");
+    apc_with_payload(sink, &keys, &b64)
 }
 
 /// 既送信画像の placement を作る（`a=p`）。
@@ -256,6 +280,32 @@ mod tests {
         assert!(hard.contains("d=I")); // 大文字 = ハード
         assert!(hard.contains("i=3"));
         assert!(!hard.contains("p="), "image delete targets the whole image");
+    }
+
+    #[test]
+    fn transmit_reference_emits_medium_key_and_b64_reference() {
+        use crate::medium::Medium;
+
+        // 共有メモリ参照: t=s、ペイロードは参照名の base64。
+        let mut shm = Vec::new();
+        transmit_reference(&mut shm, 7, 64, 48, Medium::SharedMem, b"/paladocs-7").unwrap();
+        let apcs = parse_apcs(&shm);
+        assert_eq!(apcs.len(), 1);
+        let (keys, payload) = &apcs[0];
+        for needle in ["a=t", "f=32", "i=7", "s=64", "v=48", "t=s", "m=0"] {
+            assert!(keys.contains(needle), "keys {keys:?} missing {needle}");
+        }
+        assert!(!keys.contains("t=d"), "must not be direct: {keys:?}");
+        let decoded = crate::base64::decode(payload.as_bytes()).unwrap();
+        assert_eq!(decoded, b"/paladocs-7");
+
+        // 一時ファイル参照: t=f。
+        let mut file = Vec::new();
+        transmit_reference(&mut file, 9, 10, 10, Medium::TempFile, b"/tmp/p.rgba").unwrap();
+        let (keys, payload) = &parse_apcs(&file)[0];
+        assert!(keys.contains("t=f"), "keys {keys:?} missing t=f");
+        let decoded = crate::base64::decode(payload.as_bytes()).unwrap();
+        assert_eq!(decoded, b"/tmp/p.rgba");
     }
 
     #[test]

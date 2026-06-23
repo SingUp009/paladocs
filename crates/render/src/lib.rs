@@ -28,7 +28,7 @@
 //! [`changed_region`] / [`crop`] / [`composite`] / [`fit`] はすべて純粋関数であり、
 //! パニックしない。範囲外の入力に対しては `None` を返すか、範囲外画素をクリップする。
 
-use paladocs_core::FrameId;
+use paladocs_core::{FrameId, SizePt};
 use std::fmt;
 
 /// pixel 単位の 2D サイズ。
@@ -385,6 +385,31 @@ pub fn fit(content: PixelSize, viewport: PixelSize) -> Rect {
     Rect { x, y, w, h }
 }
 
+/// ページ（pt）を `viewport`（pixel）へアスペクト保持で収めるときの
+/// **pixels-per-point** スケールを返す。
+///
+/// [`fit`] でビューポート内の充填矩形を求め、`scale = fit.w / page_pt.w` とする。
+/// この値で `typst` 側がページを再ラスタすれば、出力寸法はビューポートに追従する
+/// （固定 DPI ではない）。本クレートは拡縮を行わないため、スケールの算出のみ担う。
+///
+/// 退避値 `1.0` を返す場合:
+/// - `page_pt.w <= 0` または `page_pt.h <= 0`（不正なページサイズ）。
+/// - `fit` の結果が幅 0（ビューポートが空など）。
+pub fn scale_for(page_pt: SizePt, viewport: PixelSize) -> f32 {
+    if page_pt.w <= 0.0 || page_pt.h <= 0.0 {
+        return 1.0;
+    }
+    let content = PixelSize {
+        w: (page_pt.w.round() as u32).max(1),
+        h: (page_pt.h.round() as u32).max(1),
+    };
+    let rect = fit(content, viewport);
+    if rect.w == 0 {
+        return 1.0;
+    }
+    rect.w as f32 / page_pt.w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,5 +754,44 @@ mod tests {
                 h: 0
             }
         );
+    }
+
+    #[test]
+    fn scale_for_follows_viewport() {
+        // page 100x56.25 pt（16:9）を 1600x900 px に収める → scale = 1600/100 = 16。
+        let page = SizePt { w: 100.0, h: 56.25 };
+        let s = scale_for(page, PixelSize { w: 1600, h: 900 });
+        assert!((s - 16.0).abs() < 1e-3, "scale = {s}");
+    }
+
+    #[test]
+    fn scale_for_doubles_with_viewport_dimension() {
+        // 同一ページでビューポートの線形寸法が 2 倍（面積 4 倍）になれば scale も 2 倍。
+        // identity / 固定 dpi 実装ではここで落ちる。
+        let page = SizePt { w: 100.0, h: 56.25 };
+        let small = scale_for(page, PixelSize { w: 800, h: 450 });
+        let large = scale_for(page, PixelSize { w: 1600, h: 900 });
+        assert!(
+            (large - 2.0 * small).abs() < 1e-3,
+            "small={small} large={large}"
+        );
+    }
+
+    #[test]
+    fn scale_for_invalid_page_is_unit() {
+        assert_eq!(
+            scale_for(SizePt { w: 0.0, h: 10.0 }, PixelSize { w: 100, h: 100 }),
+            1.0
+        );
+        assert_eq!(
+            scale_for(SizePt { w: 10.0, h: 0.0 }, PixelSize { w: 100, h: 100 }),
+            1.0
+        );
+    }
+
+    #[test]
+    fn scale_for_zero_viewport_is_unit() {
+        let page = SizePt { w: 100.0, h: 56.25 };
+        assert_eq!(scale_for(page, PixelSize { w: 0, h: 0 }), 1.0);
     }
 }
