@@ -77,8 +77,21 @@ impl BitOrAssign for CellAttrs {
 /// セルの前景／背景に使う **RGBA 色値**（`[r, g, b, a]`、sRGB バイト空間）。
 ///
 /// 画像バッファ型 [`Rgba`](crate::Rgba) とは別物で、こちらは「1 ピクセル分の色」を
-/// 表す。端末セルにアルファは無いため、[`Cell`] 内の色は常に不透明（`a == 255`）。
+/// 表す。アルファは「端末への色指定の種別」を表す:
+/// - `a == 255`: 不透明な truecolor（`r, g, b` をそのまま指定）。量子化（mosaic）由来の
+///   セルは常にこれ。
+/// - `a == 0`: **端末既定色**（[`DEFAULT`]）。`term` は truecolor を発行せず端末の既定
+///   前景／背景（SGR `39`/`49`）を使う。TUI 投影の地色・本文色がこれ。
+///
+/// 中間アルファは使わない（合成は量子化前に完了している前提）。
 pub type Color = [u8; 4];
+
+/// 端末既定色を表す番兵（アルファ 0）。
+///
+/// このセル色を持つ前景／背景は、`term` 側で truecolor ではなく端末の**既定色**
+/// （SGR `39` 前景 / `49` 背景）として発行される。背景に使えば地色が端末テーマに
+/// 追従して透過し、前景に使えば文字色が端末テーマに追従する（TUI 投影で使用）。
+pub const DEFAULT: Color = [0, 0, 0, 0];
 
 /// セルが占有する端末カラム数の種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,8 +111,10 @@ pub enum CellWidth {
 
 /// 端末文字セル 1 個。
 ///
-/// 不変条件: 端末にアルファは無いため Cell は**常に不透明**（`fg[3] == 255 &&
-/// bg[3] == 255`）。アルファ合成は量子化前に完了している前提。
+/// 色は不透明 truecolor（`a == 255`）または端末既定色（[`DEFAULT`]、`a == 0`）の
+/// いずれか。中間アルファは持たない（合成は量子化前に完了している前提）。量子化
+/// （mosaic）由来のセルは常に不透明、TUI 投影由来のセルは前景／背景に [`DEFAULT`] を
+/// 用いて端末テーマへ追従する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     /// 表示文字。
@@ -127,6 +142,11 @@ impl Cell {
             width: CellWidth::Narrow,
             attrs: CellAttrs::NONE,
         }
+    }
+
+    /// 端末既定の前景／背景（[`DEFAULT`]）の空白セル。TUI 投影の地セルに使う。
+    pub fn transparent() -> Self {
+        Self::blank(DEFAULT, DEFAULT)
     }
 
     /// 不透明（`fg[3] == 255 && bg[3] == 255`）か。
@@ -332,6 +352,101 @@ fn box_range(idx: u32, samples: u32, dim: u32) -> (u32, u32) {
         let c = lo.min(dim - 1);
         (c, c + 1)
     }
+}
+
+/// 罫線（box-drawing）コーナースタイル。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoxStyle {
+    /// 直角コーナー `┌┐└┘`。
+    #[default]
+    Square,
+    /// 丸コーナー `╭╮╰╯`。
+    Rounded,
+}
+
+impl BoxStyle {
+    /// `(top_left, top_right, bottom_left, bottom_right)` のコーナー文字。
+    fn corners(self) -> (char, char, char, char) {
+        match self {
+            BoxStyle::Square => ('┌', '┐', '└', '┘'),
+            BoxStyle::Rounded => ('╭', '╮', '╰', '╯'),
+        }
+    }
+}
+
+/// 横罫線文字 `─`。
+const H_LINE: char = '─';
+/// 縦罫線文字 `│`。
+const V_LINE: char = '│';
+
+/// 罫線セル 1 個を置く（背景は [`DEFAULT`]、幅 [`CellWidth::Narrow`]）。
+///
+/// `u32` 座標は `u16` 範囲内のみ [`CellGrid::set`] へ渡す（範囲外は無視）。
+fn set_line_cell(grid: &mut CellGrid, col: u32, row: u32, ch: char, fg: Color, attrs: CellAttrs) {
+    if col > u16::MAX as u32 || row > u16::MAX as u32 {
+        return;
+    }
+    grid.set(
+        col as u16,
+        row as u16,
+        Cell {
+            ch,
+            fg,
+            bg: DEFAULT,
+            width: CellWidth::Narrow,
+            attrs,
+        },
+    );
+}
+
+/// `row` の `[col, col+len)` に横罫線 `─` を引く。grid 範囲外はクリップ。
+pub fn draw_hline(grid: &mut CellGrid, row: u32, col: u32, len: u32, fg: Color, attrs: CellAttrs) {
+    for i in 0..len {
+        set_line_cell(grid, col.saturating_add(i), row, H_LINE, fg, attrs);
+    }
+}
+
+/// `col` の `[row, row+len)` に縦罫線 `│` を引く。grid 範囲外はクリップ。
+pub fn draw_vline(grid: &mut CellGrid, col: u32, row: u32, len: u32, fg: Color, attrs: CellAttrs) {
+    for i in 0..len {
+        set_line_cell(grid, col, row.saturating_add(i), V_LINE, fg, attrs);
+    }
+}
+
+/// `rect`（セル空間）の**外周だけ**を罫線で `grid` に描く（塗りはしない）。
+///
+/// `fg` は罫線色（[`DEFAULT`] で端末既定前景）。罫線セルの背景は [`DEFAULT`]（透過）。
+/// grid 範囲外はクリップしパニックしない。退化形:
+/// - `w == 0 || h == 0` → 何もしない。
+/// - `w == 1` → 縦 1 本（[`draw_vline`]）。`h == 1` → 横 1 本（[`draw_hline`]）。
+pub fn draw_box(grid: &mut CellGrid, rect: Rect, fg: Color, attrs: CellAttrs, style: BoxStyle) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    if rect.w == 1 {
+        draw_vline(grid, rect.x, rect.y, rect.h, fg, attrs);
+        return;
+    }
+    if rect.h == 1 {
+        draw_hline(grid, rect.y, rect.x, rect.w, fg, attrs);
+        return;
+    }
+    let (tl, tr, bl, br) = style.corners();
+    let x0 = rect.x;
+    let x1 = rect.x.saturating_add(rect.w - 1);
+    let y0 = rect.y;
+    let y1 = rect.y.saturating_add(rect.h - 1);
+    // 上下辺（コーナーの内側だけ横線）。
+    draw_hline(grid, y0, x0 + 1, rect.w - 2, fg, attrs);
+    draw_hline(grid, y1, x0 + 1, rect.w - 2, fg, attrs);
+    // 左右辺（コーナーの内側だけ縦線）。
+    draw_vline(grid, x0, y0 + 1, rect.h - 2, fg, attrs);
+    draw_vline(grid, x1, y0 + 1, rect.h - 2, fg, attrs);
+    // コーナー。
+    set_line_cell(grid, x0, y0, tl, fg, attrs);
+    set_line_cell(grid, x1, y0, tr, fg, attrs);
+    set_line_cell(grid, x0, y1, bl, fg, attrs);
+    set_line_cell(grid, x1, y1, br, fg, attrs);
 }
 
 /// セルの水平ラン（同一行の連続変更領域）。term のカーソル移動 + SGR 発行単位に対応。
@@ -809,5 +924,125 @@ mod tests {
                 len: 2
             }]
         );
+    }
+
+    // ---- 罫線（box-drawing） ----
+
+    fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn draw_box_outline_corners_edges_and_hollow_interior() {
+        let mut g = CellGrid::new_blank(6, 4, BLACK);
+        draw_box(
+            &mut g,
+            rect(1, 0, 4, 3),
+            DEFAULT,
+            CellAttrs::NONE,
+            BoxStyle::Square,
+        );
+        // コーナー。
+        assert_eq!(g.get(1, 0).ch, '┌');
+        assert_eq!(g.get(4, 0).ch, '┐');
+        assert_eq!(g.get(1, 2).ch, '└');
+        assert_eq!(g.get(4, 2).ch, '┘');
+        // 辺。
+        assert_eq!(g.get(2, 0).ch, '─');
+        assert_eq!(g.get(3, 0).ch, '─');
+        assert_eq!(g.get(1, 1).ch, '│');
+        assert_eq!(g.get(4, 1).ch, '│');
+        // 内部は触らない（地セルのまま、罫線色は端末既定）。
+        assert_eq!(g.get(2, 1).ch, ' ');
+        // 罫線セルの背景は DEFAULT（透過）。
+        assert_eq!(g.get(1, 0).bg, DEFAULT);
+        // 枠外は不変。
+        assert_eq!(g.get(0, 0).ch, ' ');
+        assert_eq!(g.get(5, 0).ch, ' ');
+    }
+
+    #[test]
+    fn draw_box_rounded_uses_arc_corners() {
+        let mut g = CellGrid::new_blank(4, 3, BLACK);
+        draw_box(
+            &mut g,
+            rect(0, 0, 4, 3),
+            WHITE,
+            CellAttrs::NONE,
+            BoxStyle::Rounded,
+        );
+        assert_eq!(g.get(0, 0).ch, '╭');
+        assert_eq!(g.get(3, 0).ch, '╮');
+        assert_eq!(g.get(0, 2).ch, '╰');
+        assert_eq!(g.get(3, 2).ch, '╯');
+    }
+
+    #[test]
+    fn draw_box_degenerate_dims() {
+        // w==1 → 縦線のみ（コーナー無し）。
+        let mut g = CellGrid::new_blank(3, 3, BLACK);
+        draw_box(
+            &mut g,
+            rect(1, 0, 1, 3),
+            DEFAULT,
+            CellAttrs::NONE,
+            BoxStyle::Square,
+        );
+        for row in 0..3 {
+            assert_eq!(g.get(1, row).ch, '│');
+        }
+        // h==1 → 横線のみ。
+        let mut g2 = CellGrid::new_blank(3, 3, BLACK);
+        draw_box(
+            &mut g2,
+            rect(0, 2, 3, 1),
+            DEFAULT,
+            CellAttrs::NONE,
+            BoxStyle::Square,
+        );
+        for col in 0..3 {
+            assert_eq!(g2.get(col, 2).ch, '─');
+        }
+        // w==0 → 無変更。
+        let mut g3 = CellGrid::new_blank(2, 2, BLACK);
+        draw_box(
+            &mut g3,
+            rect(0, 0, 0, 2),
+            DEFAULT,
+            CellAttrs::NONE,
+            BoxStyle::Square,
+        );
+        assert_eq!(g3.get(0, 0).ch, ' ');
+    }
+
+    #[test]
+    fn draw_box_clips_at_grid_edge_without_panic() {
+        let mut g = CellGrid::new_blank(3, 3, BLACK);
+        // grid をはみ出す矩形でもパニックせず、内側だけ描く。
+        draw_box(
+            &mut g,
+            rect(1, 1, 10, 10),
+            DEFAULT,
+            CellAttrs::NONE,
+            BoxStyle::Square,
+        );
+        assert_eq!(g.get(1, 1).ch, '┌');
+        // 右下コーナーは範囲外なので出ない（クリップ）。範囲内の辺は描かれる。
+        assert_eq!(g.get(2, 1).ch, '─');
+        assert_eq!(g.get(1, 2).ch, '│');
+    }
+
+    #[test]
+    fn lines_draw_runs() {
+        let mut g = CellGrid::new_blank(5, 3, BLACK);
+        draw_hline(&mut g, 0, 1, 3, DEFAULT, CellAttrs::NONE);
+        for col in 1..4 {
+            assert_eq!(g.get(col, 0).ch, '─');
+        }
+        assert_eq!(g.get(0, 0).ch, ' ');
+        draw_vline(&mut g, 4, 0, 3, DEFAULT, CellAttrs::NONE);
+        for row in 0..3 {
+            assert_eq!(g.get(4, row).ch, '│');
+        }
     }
 }

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use paladocs_core::FrameId;
-use paladocs_render::{CellWidth, PixelSize};
+use paladocs_render::{CellWidth, DEFAULT, PixelSize};
 use paladocs_typst::{
     CompiledDeck, EngineError, PaladocsWorld, RenderOpts, compile_deck, render_step,
 };
@@ -262,7 +262,7 @@ fn reload_picks_up_source_changes() {
 // ---- B: ページ→セル投影（render_step）----
 
 #[test]
-fn render_step_dims_and_opacity() {
+fn render_step_dims_and_invariants() {
     let project = TempProject::new(
         &(pdfpc(&[(0, "1")]) + "#set page(width: 100pt, height: 50pt, margin: 0pt)\n= Hi"),
     );
@@ -273,13 +273,19 @@ fn render_step_dims_and_opacity() {
         pixel_per_pt: 3.0,
     };
     let grid = render_step(&compiled, 0, &opts).unwrap();
-    assert_eq!(grid.dims(), (20, 8)); // 不変条件4: dims
+    assert_eq!(grid.dims(), (20, 8)); // dims 不変条件
     for row in grid.rows() {
         for cell in row {
-            assert_eq!(cell.fg[3], 255, "fg opaque");
-            assert_eq!(cell.bg[3], 255, "bg opaque");
-            // 不変条件5: Wide の右隣は必ず Continuation。
+            // 色は不透明 truecolor（a==255）か端末既定（a==0）のいずれか。
+            assert!(cell.fg[3] == 0 || cell.fg[3] == 255, "fg a∈{{0,255}}");
+            assert!(cell.bg[3] == 0 || cell.bg[3] == 255, "bg a∈{{0,255}}");
+            // モザイクは使わない: ▀ は出ない。
+            assert_ne!(
+                cell.ch, '\u{2580}',
+                "semantic projection must not use mosaic"
+            );
         }
+        // 不変条件: Wide の右隣は必ず Continuation。
         for (c, cell) in row.iter().enumerate() {
             if cell.width == CellWidth::Wide {
                 assert_eq!(row[c + 1].width, CellWidth::Continuation);
@@ -289,8 +295,9 @@ fn render_step_dims_and_opacity() {
 }
 
 #[test]
-fn render_step_solid_page_no_text_stays_base() {
-    // 単色ページ・テキスト無し → 全セルが背景色・▀（上書きゼロ）。
+fn render_step_no_text_no_shape_is_transparent() {
+    // 単色ページ・テキスト無し・図形無し → 地色は焼かれず全セル透過の空白。
+    // 判別: モザイク実装なら ▀ かページ色セルになり落ちる。
     let project = TempProject::new(
         &(pdfpc(&[(0, "1")])
             + "#set page(width: 100pt, height: 50pt, margin: 0pt, fill: rgb(20, 40, 60))\n#none"),
@@ -304,17 +311,16 @@ fn render_step_solid_page_no_text_stays_base() {
     let grid = render_step(&compiled, 0, &opts).unwrap();
     for row in grid.rows() {
         for cell in row {
-            assert_eq!(cell.fg, [20, 40, 60, 255]);
-            assert_eq!(cell.bg, [20, 40, 60, 255]);
-            assert_eq!(cell.ch, '\u{2580}', "no text → half-block base only");
+            assert_eq!(cell.ch, ' ', "no content → blank");
+            assert_eq!(cell.fg, DEFAULT, "fg terminal-default (transparent)");
+            assert_eq!(cell.bg, DEFAULT, "bg terminal-default (transparent)");
         }
     }
 }
 
 #[test]
-fn render_step_latin_text_overwrites_cells() {
-    // ラテン文字を含むページ → グリフセルが base のもやけ ▀ から鮮明な文字へ置換される。
-    // 判別: テキスト無しページ（上のテスト）は文字セルゼロ。
+fn render_step_latin_text_is_crisp_default_fg() {
+    // ラテン文字を含むページ → 鮮明な文字セル（モザイク ▀ ではない）、前景は端末既定。
     let project = TempProject::new(
         &(pdfpc(&[(0, "1")])
             + "#set page(width: 200pt, height: 40pt, margin: 4pt, fill: white)\n#text(size: 20pt)[Hello]"),
@@ -326,9 +332,43 @@ fn render_step_latin_text_overwrites_cells() {
         pixel_per_pt: 4.0,
     };
     let grid = render_step(&compiled, 0, &opts).unwrap();
-    let has_letter = grid
+    let letters: Vec<&_> = grid
         .rows()
         .flat_map(|r| r.iter())
-        .any(|c| c.ch.is_ascii_alphabetic());
-    assert!(has_letter, "latin text should place letter cells");
+        .filter(|c| c.ch.is_ascii_alphabetic())
+        .collect();
+    assert!(!letters.is_empty(), "latin text should place letter cells");
+    assert!(
+        letters.iter().all(|c| c.fg == DEFAULT),
+        "v1 text fg is terminal-default"
+    );
+    // モザイクは使わない。
+    assert!(
+        grid.rows()
+            .flat_map(|r| r.iter())
+            .all(|c| c.ch != '\u{2580}'),
+        "no half-block mosaic"
+    );
+}
+
+#[test]
+fn render_step_stroked_rect_draws_box_outline() {
+    // 枠線付き矩形 → アウトライン罫線（┌ 等）が出る。判別: 図形を無視する実装は落ちる。
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")])
+            + "#set page(width: 120pt, height: 80pt, margin: 0pt, fill: white)\n#place(top + left, dx: 10pt, dy: 10pt, rect(width: 80pt, height: 50pt, stroke: 1pt + black))"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let opts = RenderOpts {
+        cols: 60,
+        rows: 30,
+        pixel_per_pt: 2.0,
+    };
+    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let box_chars = ['┌', '┐', '└', '┘', '─', '│'];
+    let has_box = grid
+        .rows()
+        .flat_map(|r| r.iter())
+        .any(|c| box_chars.contains(&c.ch));
+    assert!(has_box, "stroked rect must render as box-drawing outline");
 }

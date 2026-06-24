@@ -183,14 +183,24 @@ impl<W: Write> CellSink<W> {
     }
 }
 
-/// `38;2;r;g;b`（truecolor 前景）。
+/// 前景 SGR。不透明（`a == 255`）は `38;2;r;g;b`（truecolor）、端末既定
+/// （[`paladocs_render::DEFAULT`]、`a == 0`）は `39`（端末既定前景）。
 fn fg_param(c: Color) -> String {
-    format!("38;2;{};{};{}", c[0], c[1], c[2])
+    if c[3] == 0 {
+        "39".to_string()
+    } else {
+        format!("38;2;{};{};{}", c[0], c[1], c[2])
+    }
 }
 
-/// `48;2;r;g;b`（truecolor 背景）。
+/// 背景 SGR。不透明（`a == 255`）は `48;2;r;g;b`（truecolor）、端末既定
+/// （[`paladocs_render::DEFAULT`]、`a == 0`）は `49`（端末既定背景＝透過）。
 fn bg_param(c: Color) -> String {
-    format!("48;2;{};{};{}", c[0], c[1], c[2])
+    if c[3] == 0 {
+        "49".to_string()
+    } else {
+        format!("48;2;{};{};{}", c[0], c[1], c[2])
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +285,21 @@ mod tests {
         let s = out(sink);
         assert!(!s.contains("\x1b[1m"));
         assert!(!s.contains(";1;")); // 連結中にも bold コード無し
+    }
+
+    #[test]
+    fn default_colors_emit_terminal_default_sgr() {
+        use paladocs_render::DEFAULT;
+        // TUI 投影セル: 前景 DEFAULT・背景 DEFAULT → `39`/`49`（truecolor を出さない）。
+        let mut grid = CellGrid::new_blank(1, 1, DEFAULT);
+        grid.set(0, 0, narrow('A', DEFAULT, DEFAULT, CellAttrs::NONE));
+        let mut sink = CellSink::new(Vec::new());
+        sink.draw_full(&grid, (1, 1)).unwrap();
+        let s = out(sink);
+        assert!(s.contains("39"), "default fg must emit 39: {s:?}");
+        assert!(s.contains("49"), "default bg must emit 49: {s:?}");
+        assert!(!s.contains("38;2;"), "must not emit truecolor fg: {s:?}");
+        assert!(!s.contains("48;2;"), "must not emit truecolor bg: {s:?}");
     }
 
     #[test]

@@ -1,51 +1,55 @@
-//! B: ページ→CellGrid 投影（MDPT 方式 = approach B）。
+//! ページ→CellGrid の**意味的 TUI 投影**。
 //!
-//! 各 Step（= 物理ページ）を「ラスタ base ＋ テキスト上書き」でセル化する:
+//! 各 Step（= 物理ページ）を、ラスタ（写真的モザイク）ではなく Typst フレームの
+//! 意味構造から直接セル化する。狙いは端末ネイティブな TUI 見た目:
 //!
-//! - **B-1 base ラスタ**: `typst_render::render` の premultiplied Pixmap を正準
-//!   ストレートアルファ [`Frame`] へ変換し、[`quantize_half_block`] で base
-//!   [`CellGrid`] にする。
-//! - **B-2 テキスト上書き**: `page.frame` のテキスト走を再帰的にたどり、各グリフを
-//!   鮮明なセルとして base に上書きする。背景は常に `page_bg`（base サンプル禁止＝
-//!   グリフインク汚染回避、ブリーフ判断2）。
-//! - **B-3 CJK グリッドスナップ**: 行ごとにセルカーソルを持ち、比例配置→monospace の
-//!   累積丸めドリフトを断つ（ブリーフ判断3）。
+//! - **地色は端末既定（透過）**。ページ塗りは焼かない（[`paladocs_render::DEFAULT`]）。
+//! - **図形 `Shape`** のうち `Geometry::Rect` は**アウトライン罫線**（[`draw_box`]）、
+//!   `Geometry::Line` は横／縦罫線（[`draw_hline`]/[`draw_vline`]）で描く。塗りは
+//!   再現しない（アウトラインのみ）。`Curve` と `Image` は v1 では描かない。
+//! - **テキスト** は `page.frame` を再帰走査し、各グリフを鮮明なセルとして配置する
+//!   （[`overlay_runs`]）。前景は端末既定色（テーマ追従、暗い端末でも可読）。サイズ
+//!   ティアの BOLD（[`tier_attrs`]）は保つ。CJK は行ごとのカーソルでグリッドスナップ
+//!   し、比例配置→monospace の累積ドリフトを断つ。
 //!
-//! ANSI 出力（term）・アスペクト調整（cli）は本クレートのスコープ外。
+//! 旧来の半ブロックモザイク（`quantize_half_block`）は使わない。これによりモザイク済み
+//! テキストと上書きテキストの二重描画が原理的に消える。ANSI 出力（term）・アスペクト
+//! 調整（cli）は本クレートのスコープ外。
 
 use std::collections::HashMap;
 
-use paladocs_core::FrameId;
-use paladocs_render::{Cell, CellAttrs, CellGrid, CellWidth, Color, Frame, quantize_half_block};
+use paladocs_render::{
+    BoxStyle, Cell, CellAttrs, CellGrid, CellWidth, Color, DEFAULT, Rect, draw_box, draw_hline,
+    draw_vline,
+};
 use typst::layout::{Abs, Frame as TypstFrame, FrameItem, Point, Transform};
 use typst::text::TextItem;
-use typst::visualize::Paint;
-use typst_render::RenderOptions;
+use typst::visualize::{Geometry, Shape};
 use unicode_width::UnicodeWidthChar;
 
 use crate::CompiledDeck;
-use crate::convert;
 use crate::diag::EngineError;
 
 /// `render_step` の描画パラメータ。
 ///
 /// `(cols, rows)` は呼び出し側が端末サイズ＋スライドアスペクト（`fit`/letterbox）から
-/// 与える。本クレートはアスペクト調整しない。`pixel_per_pt` は base ラスタ（図形・
-/// 画像）が十分鮮明になる値を選ぶ。
+/// 与える。本クレートはアスペクト調整しない。
 pub struct RenderOpts {
     /// 出力グリッドのカラム数。
     pub cols: u16,
     /// 出力グリッドの行数。
     pub rows: u16,
-    /// base ラスタの解像度（pixels-per-pt）。
+    /// 図形を画像としてラスタ化する際の解像度（pixels-per-pt）。**v1 の意味投影
+    /// （アウトライン罫線＋テキスト）では未使用**で、将来 `Image`/`Curve` をモザイクで
+    /// 描く拡張のために予約する成長点。
     pub pixel_per_pt: f32,
 }
 
-/// `compiled` の物理ページ `page_idx` を「ラスタ base ＋ テキスト上書き」で
-/// `(cols, rows)` の [`CellGrid`] に投影する。
+/// `compiled` の物理ページ `page_idx` を意味的 TUI 投影で `(cols, rows)` の
+/// [`CellGrid`] にする（地色は端末既定＝透過、図形はアウトライン罫線、テキストは鮮明）。
 ///
 /// 不変条件:
-/// - 出力 dims == `(opts.cols, opts.rows)`、全 Cell 不透明（render 不変条件3 継承）。
+/// - 出力 dims == `(opts.cols, opts.rows)`。
 /// - [`CellWidth::Wide`] の右隣は必ず [`CellWidth::Continuation`]（render 不変条件4）。
 ///
 /// `page_idx` が範囲外なら [`EngineError::Render`]。
@@ -62,26 +66,18 @@ pub fn render_step(
         ))
     })?;
 
-    // ページの背景色（不透明 Color）。`None`（透過）/`Auto` は v1 では不透明白、
-    // 単色塗りはストレート sRGB バイトへ。Gradient/Tiling も v1 は白で代用する。
-    let page_bg = resolve_page_bg(page.fill_or_white());
-
-    // --- B-1 base ラスタ ---
-    let render_opts = RenderOptions {
-        pixel_per_pt: (opts.pixel_per_pt as f64).into(),
-        render_bleed: false,
-    };
-    let pixmap = typst_render::render(page, &render_opts);
-    let image = convert::pixmap_to_rgba(&pixmap)?;
-    let frame = Frame {
-        id: FrameId(page_idx as u32),
-        image,
-    };
-    let mut grid = quantize_half_block(&frame, opts.cols, opts.rows, page_bg);
-
-    // --- B-2 テキスト上書き ---
     let frame_w_pt = page.frame.width().to_pt();
     let frame_h_pt = page.frame.height().to_pt();
+
+    // 地色は端末既定（透過）。ページ塗りは焼かない。
+    let mut grid = CellGrid::new_blank(opts.cols, opts.rows, DEFAULT);
+
+    // --- 図形（Rect/Line）をアウトライン罫線で描く ---
+    let mut shapes = Vec::new();
+    collect_shapes(&page.frame, Transform::identity(), &mut shapes);
+    draw_shapes(&mut grid, &shapes, frame_w_pt, frame_h_pt);
+
+    // --- テキストを鮮明なセルとして上書き ---
     let mut runs = Vec::new();
     collect_runs(
         &page.frame,
@@ -89,7 +85,7 @@ pub fn render_step(
         compiled.body_size_pt,
         &mut runs,
     );
-    overlay_runs(&mut grid, &runs, frame_w_pt, frame_h_pt, page_bg);
+    overlay_runs(&mut grid, &runs, frame_w_pt, frame_h_pt, DEFAULT);
 
     Ok(grid)
 }
@@ -103,7 +99,7 @@ const H2_RATIO: f64 = 1.2;
 ///
 /// `>= body*1.5` → H1、`>= body*1.2` → H2、それ未満 → 本文（`NONE`）。当面 H1/H2 は
 /// いずれも `BOLD`（`UNDERLINE` は将来の調整点として `H1_RATIO` 等とともに残す）。
-/// **色には一切触れない**（fg は呼び出し側が `TextItem::fill` から決める）。`body <= 0`
+/// **色には一切触れない**（v1 の fg は端末既定 [`DEFAULT`]）。`body <= 0`
 /// （テキスト無し）は全 `NONE`。
 ///
 /// これはサイズベースの見た目近似であり Typst の意味的見出しではない。将来 introspection
@@ -121,18 +117,6 @@ fn tier_attrs(size_pt: f64, body_pt: f64) -> CellAttrs {
         CellAttrs::BOLD // H2
     } else {
         CellAttrs::NONE
-    }
-}
-
-/// 解決済み `Page.fill` を不透明セル背景 [`Color`] にする。
-fn resolve_page_bg(fill: Option<Paint>) -> Color {
-    match fill {
-        Some(Paint::Solid(color)) => {
-            let (r, g, b, _) = color.to_rgb().into_format::<u8, u8>().into_components();
-            [r, g, b, 255]
-        }
-        // 透過（None）・Gradient・Tiling は v1 では不透明白で代用する。
-        _ => [255, 255, 255, 255],
     }
 }
 
@@ -191,14 +175,9 @@ fn collect_text(
     body_pt: f64,
     out: &mut Vec<PlacedRun>,
 ) {
-    // 単色塗りなら fg を straight sRGB バイトへ。Gradient/Tiling は None（base サンプル）。
-    let fg = match &text.fill {
-        Paint::Solid(color) => {
-            let (r, g, b, _) = color.to_rgb().into_format::<u8, u8>().into_components();
-            Some([r, g, b, 255])
-        }
-        Paint::Gradient(_) | Paint::Tiling(_) => None,
-    };
+    // v1 は文字色を端末既定（DEFAULT）に統一する（テーマ追従・暗い端末でも可読）。
+    // Typst のテキスト色は今は採らない（将来、明確な着色のみ truecolor 化する成長点）。
+    let fg = Some(DEFAULT);
     let attrs = tier_attrs(text.size.to_pt(), body_pt);
 
     let mut advance = Abs::zero();
@@ -415,6 +394,137 @@ impl RunGlyph {
         match self.width {
             CellWidth::Wide => 2,
             _ => 1,
+        }
+    }
+}
+
+/// 描画対象の図形（ページ pt 座標、軸並行 bbox 近似）。
+enum ShapeKind {
+    /// 矩形。左上 `(x_pt, y_pt)` から幅・高さ（page pt）。
+    Rect { w_pt: f64, h_pt: f64 },
+    /// 線分。始点 `(x_pt, y_pt)` からの相対変位（page pt）。
+    Line { dx_pt: f64, dy_pt: f64 },
+}
+
+/// ページ pt 座標に確定した図形 1 個。
+struct PlacedShape {
+    /// 左上（矩形）／始点（線分）の x（page pt）。
+    x_pt: f64,
+    /// 同 y（page pt）。
+    y_pt: f64,
+    /// 種別と寸法。
+    kind: ShapeKind,
+}
+
+/// `frame` の図形走（`Rect`/`Line`）を `ts` を畳みながら再帰収集する。
+///
+/// グループ変換の合成は [`collect_runs`] と同順（`ts' = ts ∘ translate(pos) ∘
+/// group.transform`）。`Curve` と非図形（Text/Image/Link/Tag）は収集しない。
+fn collect_shapes(frame: &TypstFrame, ts: Transform, out: &mut Vec<PlacedShape>) {
+    for (pos, item) in frame.items() {
+        match item {
+            FrameItem::Group(group) => {
+                let child_ts = ts
+                    .pre_concat(Transform::translate(pos.x, pos.y))
+                    .pre_concat(group.transform);
+                collect_shapes(&group.frame, child_ts, out);
+            }
+            FrameItem::Shape(shape, _) => collect_shape(shape, *pos, ts, out),
+            _ => {}
+        }
+    }
+}
+
+/// 1 つの [`Shape`] を `ts` でページ座標へ写し、`Rect`/`Line` を [`PlacedShape`] に収める。
+///
+/// 矩形は 2 隅（左上・右下）を変換した軸並行 bbox で近似する（translate/scale は厳密、
+/// 回転は bbox 近似）。塗り（`fill`）は再現せずアウトラインのみ。`Curve` は無視する。
+fn collect_shape(shape: &Shape, pos: Point, ts: Transform, out: &mut Vec<PlacedShape>) {
+    let origin = pos.transform(ts);
+    match &shape.geometry {
+        Geometry::Rect(size) => {
+            let far = Point::new(pos.x + size.x, pos.y + size.y).transform(ts);
+            let (ox, oy) = (origin.x.to_pt(), origin.y.to_pt());
+            let (fx, fy) = (far.x.to_pt(), far.y.to_pt());
+            out.push(PlacedShape {
+                x_pt: ox.min(fx),
+                y_pt: oy.min(fy),
+                kind: ShapeKind::Rect {
+                    w_pt: (fx - ox).abs(),
+                    h_pt: (fy - oy).abs(),
+                },
+            });
+        }
+        Geometry::Line(point) => {
+            let end = Point::new(pos.x + point.x, pos.y + point.y).transform(ts);
+            let (ox, oy) = (origin.x.to_pt(), origin.y.to_pt());
+            let (ex, ey) = (end.x.to_pt(), end.y.to_pt());
+            out.push(PlacedShape {
+                x_pt: ox.min(ex),
+                y_pt: oy.min(ey),
+                kind: ShapeKind::Line {
+                    dx_pt: ex - ox,
+                    dy_pt: ey - oy,
+                },
+            });
+        }
+        Geometry::Curve(_) => {}
+    }
+}
+
+/// 収集済み図形を `grid` にアウトライン罫線で描く（端末既定色）。
+///
+/// pt→セルは [`overlay_runs`] と同じ `pt_per_col`/`pt_per_row`。矩形は最小 1×1 に
+/// クランプして [`draw_box`]（1 セル幅/高は自動で線へ退化）、線分は長手方向で
+/// [`draw_hline`]/[`draw_vline`] にする。
+fn draw_shapes(grid: &mut CellGrid, shapes: &[PlacedShape], frame_w_pt: f64, frame_h_pt: f64) {
+    let (cols, rows) = grid.dims();
+    if cols == 0 || rows == 0 || frame_w_pt <= 0.0 || frame_h_pt <= 0.0 {
+        return;
+    }
+    let pt_per_col = frame_w_pt / cols as f64;
+    let pt_per_row = frame_h_pt / rows as f64;
+
+    for s in shapes {
+        let x = (s.x_pt / pt_per_col).round();
+        let y = (s.y_pt / pt_per_row).round();
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+            continue;
+        }
+        match s.kind {
+            ShapeKind::Rect { w_pt, h_pt } => {
+                let w = (w_pt / pt_per_col).round();
+                let h = (h_pt / pt_per_row).round();
+                if !w.is_finite() || !h.is_finite() {
+                    continue;
+                }
+                let rect = Rect {
+                    x: x as u32,
+                    y: y as u32,
+                    w: (w as u32).max(1),
+                    h: (h as u32).max(1),
+                };
+                draw_box(grid, rect, DEFAULT, CellAttrs::NONE, BoxStyle::Square);
+            }
+            ShapeKind::Line { dx_pt, dy_pt } => {
+                if dx_pt.abs() >= dy_pt.abs() {
+                    let len = (dx_pt.abs() / pt_per_col).round();
+                    let len = if len.is_finite() {
+                        (len as u32).max(1)
+                    } else {
+                        1
+                    };
+                    draw_hline(grid, y as u32, x as u32, len, DEFAULT, CellAttrs::NONE);
+                } else {
+                    let len = (dy_pt.abs() / pt_per_row).round();
+                    let len = if len.is_finite() {
+                        (len as u32).max(1)
+                    } else {
+                        1
+                    };
+                    draw_vline(grid, x as u32, y as u32, len, DEFAULT, CellAttrs::NONE);
+                }
+            }
         }
     }
 }
@@ -678,15 +788,5 @@ mod tests {
         assert_eq!(cell_width('漢'), Some(CellWidth::Wide));
         assert_eq!(cell_width('　'), Some(CellWidth::Wide)); // 全角スペース
         assert_eq!(cell_width('\u{0301}'), None); // 結合アクセント（幅0）
-    }
-
-    /// resolve_page_bg: 単色塗りは straight sRGB（不透明）、透過/None は白。
-    #[test]
-    fn page_bg_solid_and_transparent() {
-        use typst::visualize::Color as TypstColor;
-        let solid = resolve_page_bg(Some(Paint::Solid(TypstColor::from_u8(20, 40, 60, 255))));
-        assert_eq!(solid, [20, 40, 60, 255]);
-        let transparent = resolve_page_bg(None);
-        assert_eq!(transparent, [255, 255, 255, 255]);
     }
 }

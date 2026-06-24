@@ -10,11 +10,12 @@
 
 use paladocs_render::{CellGrid, Color};
 
-/// letterbox 余白の既定背景色（中立色＝黒）。
+/// letterbox 余白の背景（端末既定色＝透過、[`paladocs_render::DEFAULT`]）。
 ///
-/// ブリーフは「page_bg か既定 bg」を許す。v1 は page_bg を typst から取り出さず、
-/// 中立色で余白（レターボックス帯）を描く。page_bg 一致は follow-up。
-pub const DEFAULT_BG: Color = [0, 0, 0, 255];
+/// 意味的 TUI 投影では地色を焼かず端末テーマに追従させるため、レターボックス帯も
+/// 端末既定色（`term` が SGR `49` を発行）にする。これでスライド本体・余白とも端末
+/// 背景が透ける。
+pub const DEFAULT_BG: Color = paladocs_render::DEFAULT;
 
 /// letterbox の結果。`(icols, irows)` は inner グリッド寸法、`(off_col, off_row)` は
 /// full グリッド内の中央寄せオフセット（セル）。
