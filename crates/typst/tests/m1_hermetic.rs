@@ -372,3 +372,26 @@ fn render_step_stroked_rect_draws_box_outline() {
         .any(|c| box_chars.contains(&c.ch));
     assert!(has_box, "stroked rect must render as box-drawing outline");
 }
+
+#[test]
+fn render_step_fill_only_rect_draws_no_box() {
+    // 塗りのみ（stroke 無し）の装飾矩形 → 罫線を描かない。判別: 全 rect を罫線化する
+    // 実装はここで落ちる。
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")])
+            + "#set page(width: 120pt, height: 80pt, margin: 0pt, fill: white)\n#place(top + left, dx: 10pt, dy: 10pt, rect(width: 80pt, height: 50pt, fill: black))"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let opts = RenderOpts {
+        cols: 60,
+        rows: 30,
+        pixel_per_pt: 2.0,
+    };
+    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let box_chars = ['┌', '┐', '└', '┘', '─', '│'];
+    let has_box = grid
+        .rows()
+        .flat_map(|r| r.iter())
+        .any(|c| box_chars.contains(&c.ch));
+    assert!(!has_box, "fill-only rect must not draw an outline");
+}

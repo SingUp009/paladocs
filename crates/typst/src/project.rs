@@ -4,13 +4,14 @@
 //! 意味構造から直接セル化する。狙いは端末ネイティブな TUI 見た目:
 //!
 //! - **地色は端末既定（透過）**。ページ塗りは焼かない（[`paladocs_render::DEFAULT`]）。
-//! - **図形 `Shape`** のうち `Geometry::Rect` は**アウトライン罫線**（[`draw_box`]）、
-//!   `Geometry::Line` は横／縦罫線（[`draw_hline`]/[`draw_vline`]）で描く。塗りは
-//!   再現しない（アウトラインのみ）。`Curve` と `Image` は v1 では描かない。
-//! - **テキスト** は `page.frame` を再帰走査し、各グリフを鮮明なセルとして配置する
-//!   （[`overlay_runs`]）。前景は端末既定色（テーマ追従、暗い端末でも可読）。サイズ
-//!   ティアの BOLD（[`tier_attrs`]）は保つ。CJK は行ごとのカーソルでグリッドスナップ
-//!   し、比例配置→monospace の累積ドリフトを断つ。
+//! - **図形 `Shape`** のうち **`stroke` を持つもの**だけを描く（枠線付き矩形＝
+//!   パネル枠、罫線）。`Geometry::Rect` は**アウトライン罫線**（[`draw_box`]）、
+//!   `Geometry::Line` は横／縦罫線（[`draw_hline`]/[`draw_vline`]）。塗りのみの装飾
+//!   矩形・`fill` は再現しない。`Curve` と `Image` は v1 では描かない。
+//! - **テキスト** は `page.frame` を再帰走査し、各グリフを**絶対比例位置**で鮮明な
+//!   セルとして配置する（[`place_runs`]）。Typst のレイアウトを忠実に投影するため
+//!   run 内/run 間とも同一基準（`x_pt / pt_per_col`）で配置する。前景は端末既定色
+//!   （テーマ追従、暗い端末でも可読）、サイズティアの BOLD（[`tier_attrs`]）は保つ。
 //!
 //! 旧来の半ブロックモザイク（`quantize_half_block`）は使わない。これによりモザイク済み
 //! テキストと上書きテキストの二重描画が原理的に消える。ANSI 出力（term）・アスペクト
@@ -85,7 +86,7 @@ pub fn render_step(
         compiled.body_size_pt,
         &mut runs,
     );
-    overlay_runs(&mut grid, &runs, frame_w_pt, frame_h_pt, DEFAULT);
+    place_runs(&mut grid, &runs, frame_w_pt, frame_h_pt);
 
     Ok(grid)
 }
@@ -141,7 +142,7 @@ struct RunGlyph {
     ch: char,
     /// セル占有幅（[`CellWidth::Narrow`] か [`CellWidth::Wide`] のみ）。
     width: CellWidth,
-    /// 前景色。`None` は単色塗り以外（Gradient/Tiling）で base サンプル代用の合図。
+    /// 前景色。v1 は端末既定（[`DEFAULT`]）。`None` は配置側で `DEFAULT` 扱い。
     fg: Option<Color>,
     /// 空白文字か（語間・タブ）。run 内では advance の列換算ぶん blank で前進する。
     is_space: bool,
@@ -238,29 +239,19 @@ fn cell_width(ch: char) -> Option<CellWidth> {
     }
 }
 
-/// 収集済み run を CJK グリッドスナップ（判断3, addendum 改修）で `grid` に上書きする。
+/// 収集済み run を「各グリフの絶対比例位置」で `grid` に配置する（Typst レイアウトの
+/// 忠実投影）。
 ///
-/// 行（baseline row）ごとにセルカーソルを持ち、document 順に各 run を:
-/// 1. **run 開始列**のみ pt で算出（`start_col = round(run.x_pt / pt_per_col)`）。
-///    その行の初回 run は `start_col` でカーソルを初期化し（行頭 base を消さない）、
-///    2 回目以降の run は `[line_cursor, max(line_cursor, start_col))` を `page_bg`
-///    blank で埋める（run 間の余白）。
-/// 2. **run 内前進は文字内容＋セル幅駆動**（pt 非依存）:
-///    - 空白グリフ → advance の列換算ぶん（`round(adv / ref_per_col)`、最低 1）を
-///      `page_bg` blank で埋めて前進（語間・タブ）。
-///    - 非空白 → `cursor` に Cell を置き `cursor += width`（Narrow=1 / Wide=2）。
-/// 3. 行末で `line_cursor = cursor`。
+/// 各グリフのページ pt 上の絶対 x は `run.x_pt + 直前グリフまでの adv_pt 累積`。配置は
+/// `col = round(x_pt / pt_per_col)`、`row = floor(run.y_pt / pt_per_row)`。空白グリフは
+/// cell を置かず advance だけ進める。**地色は透過のまま**なので run 間・字間の余白は
+/// 埋めない（端末既定色が透ける）。これにより run 内/run 間の間隔が同一基準（比例）に
+/// なり、旧実装の「run 内は密・run 間は粗」という不整合が消える。
 ///
-/// `ref_per_col` は run 内の最小の `adv/width`（= その font の 1 列ぶん自然 advance）。
-/// これにより大フォント run でも空白換算がスケール不変になり、`target=round` 方式の
-/// 累積ドリフト（字間開き）が消える。
-fn overlay_runs(
-    grid: &mut CellGrid,
-    runs: &[PlacedRun],
-    frame_w_pt: f64,
-    frame_h_pt: f64,
-    page_bg: Color,
-) {
+/// 行ごとに「次の空き列」を持ち、丸めや大フォントで列が衝突した場合は右へ単調に
+/// 押し出して重なりを防ぐ（不変条件5: [`CellWidth::Wide`] の右隣は
+/// [`CellWidth::Continuation`]）。grid 範囲外（列 `>= cols` / 行 `>= rows`）はスキップ。
+fn place_runs(grid: &mut CellGrid, runs: &[PlacedRun], frame_w_pt: f64, frame_h_pt: f64) {
     let (cols, rows) = grid.dims();
     if cols == 0 || rows == 0 || frame_w_pt <= 0.0 || frame_h_pt <= 0.0 {
         return;
@@ -268,8 +259,8 @@ fn overlay_runs(
     let pt_per_col = frame_w_pt / cols as f64;
     let pt_per_row = frame_h_pt / rows as f64;
 
-    // 行 → 次の空きカラム（line_cursor）。
-    let mut line_cursors: HashMap<u16, u16> = HashMap::new();
+    // 行 → 次の空き列（重なり防止の単調カーソル）。
+    let mut next_free: HashMap<u16, u16> = HashMap::new();
 
     for run in runs {
         let row_f = (run.y_pt / pt_per_row).floor();
@@ -277,70 +268,33 @@ fn overlay_runs(
             continue;
         }
         let row = row_f as u16;
-        let start_col = col_from_pt(run.x_pt, pt_per_col, cols);
 
-        // font スケール基準: run 内の最小 adv/width。無ければ pt_per_col へフォールバック。
-        let ref_per_col = run
-            .glyphs
-            .iter()
-            .filter(|g| !g.is_space && g.adv_pt > 0.0)
-            .map(|g| g.adv_pt / g.width_cells() as f64)
-            .fold(f64::INFINITY, f64::min);
-        let ref_per_col = if ref_per_col.is_finite() && ref_per_col > 0.0 {
-            ref_per_col
-        } else {
-            pt_per_col
-        };
-
-        // カーソル確定。初回 run は start_col で初期化（行頭 base 保持）、2 回目以降は
-        // [line_cursor, max(line_cursor, start_col)) を page_bg で埋める。
-        let mut cursor = match line_cursors.get(&row) {
-            Some(&lc) => {
-                let c = lc.max(start_col);
-                for col in lc..c.min(cols) {
-                    grid.set(col, row, Cell::blank(page_bg, page_bg));
-                }
-                c
-            }
-            None => start_col,
-        };
-
+        let mut acc_pt = 0.0; // run 開始からの累積 advance（pt）
         for g in &run.glyphs {
-            if cursor >= cols {
-                break;
-            }
+            let gx = run.x_pt + acc_pt;
+            acc_pt += g.adv_pt;
             if g.is_space {
-                // 空白の占有列数（advance を ref で列換算、最低 1）。
-                let n = (g.adv_pt / ref_per_col).round();
-                let n = if n.is_finite() && n >= 1.0 {
-                    (n as u32).min(cols as u32)
-                } else {
-                    1
-                };
-                for _ in 0..n {
-                    if cursor >= cols {
-                        break;
-                    }
-                    grid.set(cursor, row, Cell::blank(page_bg, page_bg));
-                    cursor += 1;
-                }
+                continue; // 空白は cell を置かず advance のみ
+            }
+            let col_f = (gx / pt_per_col).round();
+            if !col_f.is_finite() || col_f < 0.0 || col_f >= cols as f64 {
                 continue;
             }
-
-            let place = cursor;
-            // Gradient/Tiling は base ラスタの当該セル色を fg に代用（上書き前に読む）。
-            let fg = match g.fg {
-                Some(c) => c,
-                None => grid.get(place, row).fg,
-            };
-            cursor = if g.width == CellWidth::Wide && place + 1 < cols {
+            // 単調押し出し: 直前の占有列を越えないようにして重なりを防ぐ。
+            let free = next_free.get(&row).copied().unwrap_or(0);
+            let place = (col_f as u16).max(free);
+            if place >= cols {
+                continue;
+            }
+            let fg = g.fg.unwrap_or(DEFAULT);
+            if g.width == CellWidth::Wide && place + 1 < cols {
                 grid.set(
                     place,
                     row,
                     Cell {
                         ch: g.ch,
                         fg,
-                        bg: page_bg,
+                        bg: DEFAULT,
                         width: CellWidth::Wide,
                         attrs: run.attrs,
                     },
@@ -351,49 +305,27 @@ fn overlay_runs(
                     Cell {
                         ch: ' ',
                         fg,
-                        bg: page_bg,
+                        bg: DEFAULT,
                         width: CellWidth::Continuation,
                         attrs: run.attrs,
                     },
                 );
-                place + 2
+                next_free.insert(row, place + 2);
             } else {
-                // Narrow、または Wide が右端で入りきらない場合は Narrow へ縮退して
-                // 不変条件5（Wide の右隣は Continuation）を守る。
+                // Narrow、または Wide が右端で入りきらない場合は Narrow へ縮退。
                 grid.set(
                     place,
                     row,
                     Cell {
                         ch: g.ch,
                         fg,
-                        bg: page_bg,
+                        bg: DEFAULT,
                         width: CellWidth::Narrow,
                         attrs: run.attrs,
                     },
                 );
-                place + 1
-            };
-        }
-        line_cursors.insert(row, cursor);
-    }
-}
-
-/// run 開始 x（ページ pt）→ 起点列。負・非有限は 0、超過は `cols` でクランプ。
-fn col_from_pt(x_pt: f64, pt_per_col: f64, cols: u16) -> u16 {
-    let f = (x_pt / pt_per_col).round();
-    if f.is_finite() && f > 0.0 {
-        (f as i64).min(cols as i64) as u16
-    } else {
-        0
-    }
-}
-
-impl RunGlyph {
-    /// セル幅の列数（Narrow=1 / Wide=2）。Continuation は run 内に現れない。
-    fn width_cells(&self) -> u16 {
-        match self.width {
-            CellWidth::Wide => 2,
-            _ => 1,
+                next_free.insert(row, place + 1);
+            }
         }
     }
 }
@@ -437,9 +369,15 @@ fn collect_shapes(frame: &TypstFrame, ts: Transform, out: &mut Vec<PlacedShape>)
 
 /// 1 つの [`Shape`] を `ts` でページ座標へ写し、`Rect`/`Line` を [`PlacedShape`] に収める。
 ///
-/// 矩形は 2 隅（左上・右下）を変換した軸並行 bbox で近似する（translate/scale は厳密、
-/// 回転は bbox 近似）。塗り（`fill`）は再現せずアウトラインのみ。`Curve` は無視する。
+/// **`stroke` を持つ図形だけ**を対象にする（枠線付き矩形＝パネル枠、罫線）。塗りのみの
+/// 装飾矩形（cover/eyebrow 等）は収集しない。矩形は 2 隅（左上・右下）を変換した軸並行
+/// bbox で近似する（translate/scale は厳密、回転は bbox 近似）。塗り（`fill`）は再現
+/// せずアウトラインのみ。`Curve` は無視する。
 fn collect_shape(shape: &Shape, pos: Point, ts: Transform, out: &mut Vec<PlacedShape>) {
+    // 枠線（stroke）を持たない図形（塗りのみの装飾矩形など）は描かない。
+    if shape.stroke.is_none() {
+        return;
+    }
     let origin = pos.transform(ts);
     match &shape.geometry {
         Geometry::Rect(size) => {
@@ -533,7 +471,6 @@ fn draw_shapes(grid: &mut CellGrid, shapes: &[PlacedShape], frame_w_pt: f64, fra
 mod tests {
     use super::*;
 
-    const BG: Color = [10, 20, 30, 255];
     const FG: Color = [200, 200, 200, 255];
 
     /// run 内グリフ 1 個を作る。`is_space` は文字から自動判定。
@@ -557,16 +494,56 @@ mod tests {
         }
     }
 
-    /// pt_per_col = pt_per_row = 1.0 になる単位グリッド（x_pt がそのまま列）。
+    /// pt_per_col = pt_per_row = 1.0 になる透過の単位グリッド（x_pt がそのまま列）。
     fn unit_grid(cols: u16, rows: u16) -> CellGrid {
-        CellGrid::new_blank(cols, rows, BG)
+        CellGrid::new_blank(cols, rows, DEFAULT)
     }
 
-    /// 全角3文字 → 各 Wide＋Continuation で 6 カラム占有・列ドリフト無し。
+    /// 比例配置: 各グリフは round(x_pt/pt_per_col) に置かれる（pt_per_col=1）。
+    /// adv=2 の3文字 → 列 0,2,4、字間は透過。判別: 密詰め実装なら 0,1,2 になり落ちる。
     #[test]
-    fn full_width_three_chars_occupy_six_columns() {
+    fn glyphs_placed_at_proportional_columns() {
         let mut grid = unit_grid(8, 1);
-        // 各全角 adv=2（width2 → ref_per_col=1）。
+        let r = run(
+            0.0,
+            CellAttrs::NONE,
+            vec![
+                rg(2.0, 'a', CellWidth::Narrow, Some(FG)),
+                rg(2.0, 'b', CellWidth::Narrow, Some(FG)),
+                rg(2.0, 'c', CellWidth::Narrow, Some(FG)),
+            ],
+        );
+        place_runs(&mut grid, &[r], 8.0, 1.0);
+        assert_eq!(grid.get(0, 0).ch, 'a');
+        assert_eq!(grid.get(2, 0).ch, 'b');
+        assert_eq!(grid.get(4, 0).ch, 'c');
+        assert_eq!(grid.get(0, 0).fg, FG); // glyph 色は維持
+        // 字間（列1,3）と末尾は透過のまま（余白は埋めない）。
+        assert_eq!(*grid.get(1, 0), Cell::transparent());
+        assert_eq!(*grid.get(3, 0), Cell::transparent());
+        assert_eq!(*grid.get(7, 0), Cell::transparent());
+    }
+
+    /// run の絶対 x で配置（pt_per_col=1）。x_pt=5 の1文字 → 列5。
+    #[test]
+    fn run_positioned_at_absolute_x() {
+        let mut grid = unit_grid(8, 1);
+        let r = run(
+            5.0,
+            CellAttrs::NONE,
+            vec![rg(1.0, 'z', CellWidth::Narrow, Some(FG))],
+        );
+        place_runs(&mut grid, &[r], 8.0, 1.0);
+        assert_eq!(grid.get(5, 0).ch, 'z');
+        assert_eq!(*grid.get(0, 0), Cell::transparent());
+        assert_eq!(*grid.get(4, 0), Cell::transparent());
+    }
+
+    /// 全角は Wide＋Continuation の2セル。adv=2 の全角3文字（pt_per_col=1）→ 列 0,2,4。
+    /// 判別ペア: 半角扱いなら Continuation が出ず落ちる。
+    #[test]
+    fn wide_glyph_occupies_two_cells() {
+        let mut grid = unit_grid(8, 1);
         let r = run(
             0.0,
             CellAttrs::NONE,
@@ -576,7 +553,7 @@ mod tests {
                 rg(2.0, '体', CellWidth::Wide, Some(FG)),
             ],
         );
-        overlay_runs(&mut grid, &[r], 8.0, 1.0, BG);
+        place_runs(&mut grid, &[r], 8.0, 1.0);
         let widths: Vec<CellWidth> = (0..6).map(|c| grid.get(c, 0).width).collect();
         assert_eq!(
             widths,
@@ -592,112 +569,77 @@ mod tests {
         assert_eq!(grid.get(0, 0).ch, '漢');
         assert_eq!(grid.get(2, 0).ch, '字');
         assert_eq!(grid.get(4, 0).ch, '体');
-        // 占有外（6,7）は base のまま。
-        assert_eq!(*grid.get(6, 0), Cell::blank(BG, BG));
     }
 
-    /// 判別ペア: 半角3文字は 3 カラム（全角扱いする実装は落ちる）。
+    /// 丸めや過密で列が衝突したら右へ単調に押し出して重ならない。
+    /// adv=0.4（pt_per_col=1）の3文字 → 全て round→0,0,1 だが 0,1,2 へ押し出し。
     #[test]
-    fn half_width_three_chars_occupy_three_columns() {
-        let mut grid = unit_grid(8, 1);
+    fn overlapping_glyphs_pushed_right_monotonically() {
+        let mut grid = unit_grid(4, 1);
         let r = run(
             0.0,
             CellAttrs::NONE,
             vec![
-                rg(1.0, 'a', CellWidth::Narrow, Some(FG)),
-                rg(1.0, 'b', CellWidth::Narrow, Some(FG)),
-                rg(1.0, 'c', CellWidth::Narrow, Some(FG)),
+                rg(0.4, 'a', CellWidth::Narrow, Some(FG)),
+                rg(0.4, 'b', CellWidth::Narrow, Some(FG)),
+                rg(0.4, 'c', CellWidth::Narrow, Some(FG)),
             ],
         );
-        overlay_runs(&mut grid, &[r], 8.0, 1.0, BG);
-        for c in 0..3 {
-            assert_eq!(grid.get(c, 0).width, CellWidth::Narrow);
-        }
+        place_runs(&mut grid, &[r], 4.0, 1.0);
         assert_eq!(grid.get(0, 0).ch, 'a');
+        assert_eq!(grid.get(1, 0).ch, 'b');
         assert_eq!(grid.get(2, 0).ch, 'c');
-        assert_eq!(*grid.get(3, 0), Cell::blank(BG, BG));
     }
 
-    /// 行頭の base は消さず（カーソル遅延初期化）、run 内の空白だけ page_bg で埋める。
+    /// 2 つの run の間は埋めない（透過のまま）。判別: blank 埋め実装なら gap が page_bg。
     #[test]
-    fn leading_kept_and_inner_space_filled_with_page_bg() {
+    fn gap_between_runs_is_transparent() {
         let mut grid = unit_grid(8, 1);
-        // base に先頭 2 列を別内容で置いておく（行頭が保たれることの確認用）。
-        let marker = Cell {
-            ch: '#',
-            fg: FG,
-            bg: BG,
-            width: CellWidth::Narrow,
-            attrs: CellAttrs::NONE,
-        };
-        grid.set(0, 0, marker.clone());
-        grid.set(1, 0, marker.clone());
-        // run は列3 起点で 'a' 空白 'b'（空白 adv=1 → 1 セル blank）。
-        let r = run(
-            3.0,
-            CellAttrs::NONE,
-            vec![
-                rg(1.0, 'a', CellWidth::Narrow, Some(FG)),
-                rg(1.0, ' ', CellWidth::Narrow, Some(FG)),
-                rg(1.0, 'b', CellWidth::Narrow, Some(FG)),
-            ],
-        );
-        overlay_runs(&mut grid, &[r], 8.0, 1.0, BG);
-        // 行頭（列0,1）は base のまま（カーソルは列3で初期化されるため消えない）。
-        assert_eq!(*grid.get(0, 0), marker);
-        assert_eq!(*grid.get(1, 0), marker);
-        // 列2 は base のまま（カーソル初期化前）。
-        assert_eq!(*grid.get(2, 0), Cell::blank(BG, BG));
-        assert_eq!(grid.get(3, 0).ch, 'a');
-        // 列4 は run 内空白 → page_bg blank。
-        assert_eq!(*grid.get(4, 0), Cell::blank(BG, BG));
-        assert_eq!(grid.get(5, 0).ch, 'b');
-    }
-
-    /// テキストセルの bg は常に page_bg（base サンプルしない＝判断2）。
-    #[test]
-    fn text_cell_bg_is_page_bg() {
-        let mut grid = unit_grid(4, 1);
-        let r = run(
+        let r1 = run(
             0.0,
             CellAttrs::NONE,
             vec![rg(1.0, 'a', CellWidth::Narrow, Some(FG))],
         );
-        overlay_runs(&mut grid, &[r], 4.0, 1.0, BG);
-        assert_eq!(grid.get(0, 0).bg, BG);
-        assert_eq!(grid.get(0, 0).fg, FG);
+        let r2 = run(
+            5.0,
+            CellAttrs::NONE,
+            vec![rg(1.0, 'b', CellWidth::Narrow, Some(FG))],
+        );
+        place_runs(&mut grid, &[r1, r2], 8.0, 1.0);
+        assert_eq!(grid.get(0, 0).ch, 'a');
+        assert_eq!(grid.get(5, 0).ch, 'b');
+        for c in 1..5 {
+            assert_eq!(*grid.get(c, 0), Cell::transparent(), "gap col {c}");
+        }
     }
 
-    /// fg None（Gradient/Tiling）は上書き前の base セル fg をサンプルして代用する。
+    /// 空白グリフは cell を置かず advance だけ進める（後続が右へずれ、跡は透過）。
     #[test]
-    fn gradient_fg_samples_base_cell() {
-        let mut grid = unit_grid(4, 1);
-        let base = Cell {
-            ch: '\u{2580}',
-            fg: [1, 2, 3, 255],
-            bg: [4, 5, 6, 255],
-            width: CellWidth::Narrow,
-            attrs: CellAttrs::NONE,
-        };
-        grid.set(0, 0, base);
+    fn space_advances_without_placing_cell() {
+        let mut grid = unit_grid(8, 1);
+        // 'a' adv1, ' ' adv2, 'b' adv1 → x: a=0, b=3 → 列 0,3。列1,2は透過。
         let r = run(
             0.0,
             CellAttrs::NONE,
-            vec![rg(1.0, 'x', CellWidth::Narrow, None)],
+            vec![
+                rg(1.0, 'a', CellWidth::Narrow, Some(FG)),
+                rg(2.0, ' ', CellWidth::Narrow, Some(FG)),
+                rg(1.0, 'b', CellWidth::Narrow, Some(FG)),
+            ],
         );
-        overlay_runs(&mut grid, &[r], 4.0, 1.0, BG);
-        // fg は base の fg を採用、bg は page_bg。
-        assert_eq!(grid.get(0, 0).fg, [1, 2, 3, 255]);
-        assert_eq!(grid.get(0, 0).bg, BG);
-        assert_eq!(grid.get(0, 0).ch, 'x');
+        place_runs(&mut grid, &[r], 8.0, 1.0);
+        assert_eq!(grid.get(0, 0).ch, 'a');
+        assert_eq!(grid.get(3, 0).ch, 'b');
+        assert_eq!(*grid.get(1, 0), Cell::transparent());
+        assert_eq!(*grid.get(2, 0), Cell::transparent());
     }
 
-    /// 空 run 列なら上書きゼロ（base のまま）。
+    /// 空 run 列なら変更ゼロ（全セル透過のまま）。
     #[test]
-    fn no_runs_no_overwrite() {
+    fn no_runs_no_change() {
         let mut grid = unit_grid(4, 2);
         let before = grid.clone();
-        overlay_runs(&mut grid, &[], 4.0, 2.0, BG);
+        place_runs(&mut grid, &[], 4.0, 2.0);
         assert_eq!(grid, before);
     }
 
@@ -705,15 +647,37 @@ mod tests {
     #[test]
     fn wide_at_last_column_degrades_to_narrow() {
         let mut grid = unit_grid(2, 1);
-        // 列1（最終列）起点に Wide を狙わせる。
+        // x_pt=1（pt_per_col=1）→ 列1（最終列）。
         let r = run(
             1.0,
             CellAttrs::NONE,
             vec![rg(2.0, '漢', CellWidth::Wide, Some(FG))],
         );
-        overlay_runs(&mut grid, &[r], 2.0, 1.0, BG);
+        place_runs(&mut grid, &[r], 2.0, 1.0);
         assert_eq!(grid.get(1, 0).width, CellWidth::Narrow);
         assert_eq!(grid.get(1, 0).ch, '漢');
+    }
+
+    /// 見出し run（attrs BOLD）はセルに BOLD を付ける。本文（NONE）は付けない。
+    #[test]
+    fn bold_tier_applied_to_cells() {
+        let mut grid = unit_grid(4, 1);
+        let r = run(
+            0.0,
+            CellAttrs::BOLD,
+            vec![rg(1.0, 'T', CellWidth::Narrow, Some(FG))],
+        );
+        place_runs(&mut grid, &[r], 4.0, 1.0);
+        assert!(grid.get(0, 0).attrs.contains(CellAttrs::BOLD));
+
+        let mut g2 = unit_grid(4, 1);
+        let r2 = run(
+            0.0,
+            CellAttrs::NONE,
+            vec![rg(1.0, 'x', CellWidth::Narrow, Some(FG))],
+        );
+        place_runs(&mut g2, &[r2], 4.0, 1.0);
+        assert!(!g2.get(0, 0).attrs.contains(CellAttrs::BOLD));
     }
 
     /// ティア判定の閾値（addendum 受け入れ）。
@@ -725,60 +689,6 @@ mod tests {
         assert_eq!(tier_attrs(11.0, body), CellAttrs::NONE); // 本文
         // body <= 0（テキスト無し）は全 NONE。
         assert_eq!(tier_attrs(99.0, 0.0), CellAttrs::NONE);
-    }
-
-    /// 大フォント run（advance≈2×pt_per_col）でも字間 blank ゼロ・連続配置（ドリフト無し）。
-    /// 判別: 旧 `target=round(x_pt/pt_per_col)` 方式なら 0,2,4,6 に開いて落ちる。
-    #[test]
-    fn large_font_run_no_drift() {
-        let mut grid = unit_grid(8, 1);
-        let r = run(
-            0.0,
-            CellAttrs::BOLD,
-            vec![
-                rg(2.0, 'H', CellWidth::Narrow, Some(FG)),
-                rg(2.0, 'e', CellWidth::Narrow, Some(FG)),
-                rg(2.0, 'a', CellWidth::Narrow, Some(FG)),
-                rg(2.0, 'd', CellWidth::Narrow, Some(FG)),
-            ],
-        );
-        overlay_runs(&mut grid, &[r], 8.0, 1.0, BG);
-        assert_eq!(grid.get(0, 0).ch, 'H');
-        assert_eq!(grid.get(1, 0).ch, 'e'); // 旧方式なら blank
-        assert_eq!(grid.get(2, 0).ch, 'a');
-        assert_eq!(grid.get(3, 0).ch, 'd');
-        // H1 run は全セル BOLD。判別: 本文 run（NONE）なら BOLD 無し。
-        for c in 0..4 {
-            assert!(grid.get(c, 0).attrs.contains(CellAttrs::BOLD));
-        }
-    }
-
-    /// 判別: 本文 run（attrs NONE）はセルに BOLD を付けない。
-    #[test]
-    fn body_run_has_no_bold() {
-        let mut grid = unit_grid(4, 1);
-        let r = run(
-            0.0,
-            CellAttrs::NONE,
-            vec![rg(1.0, 'x', CellWidth::Narrow, Some(FG))],
-        );
-        overlay_runs(&mut grid, &[r], 4.0, 1.0, BG);
-        assert!(!grid.get(0, 0).attrs.contains(CellAttrs::BOLD));
-    }
-
-    /// 色非介入: テーマ着色（fg 指定）の見出し run → fg はそのまま、attrs に BOLD のみ加算。
-    #[test]
-    fn tier_does_not_touch_color() {
-        let mut grid = unit_grid(4, 1);
-        let themed = [123, 45, 67, 255];
-        let r = run(
-            0.0,
-            CellAttrs::BOLD,
-            vec![rg(1.0, 'T', CellWidth::Narrow, Some(themed))],
-        );
-        overlay_runs(&mut grid, &[r], 4.0, 1.0, BG);
-        assert_eq!(grid.get(0, 0).fg, themed); // 色は維持
-        assert!(grid.get(0, 0).attrs.contains(CellAttrs::BOLD));
     }
 
     /// cell_width: ラテン=Narrow、CJK=Wide、結合/ゼロ幅=None。
