@@ -1,12 +1,14 @@
-//! cell-mode のサイジング（letterbox）と full grid 合成（純粋）。
+//! cell-mode のサイジング（grid）と full grid 合成（純粋）。
 //!
-//! 端末セルは半ブロック量子化で縦 2 サブピクセルを持つため、画素アスペクトは
-//! `cols : rows*2` になる。スライド（`w_pt × h_pt`）をこのセル格子へアスペクト保持で
-//! 最大充填し、`render_step` に渡す inner グリッド寸法 `(icols, irows)` と中央寄せ
-//! オフセット `(off_col, off_row)` を求める（ブリーフ §サイジング）。
+//! 意味的 TUI 投影では inner グリッドを**本文サイズ基準**で決める（[`text_grid`]）:
+//! `pt_per_col ≈ body/2`・`pt_per_row ≈ body` とし、欧文 1 文字 ≒ 1 セル・CJK ≒ 2 セル
+//! に詰めて可読にする。セルの視覚アスペクトを 1:2 とみなすとスライドアスペクトも保たれる。
+//! 本文が無いデッキはアスペクト基準の [`letterbox`]（`cols : rows*2`）へフォールバック。
+//! いずれも `render_step` に渡す inner 寸法 `(icols, irows)` と中央寄せオフセット
+//! `(off_col, off_row)` を返す。
 //!
 //! 合成は cli 側の責務（render に新 API を足さない）。inner を `CellGrid::set` で
-//! letterbox 余白入りの full グリッドへ焼き込む。
+//! 余白入りの full グリッドへ焼き込む（[`compose_full`]、余白は端末既定で透過）。
 
 use paladocs_render::{CellGrid, Color};
 
@@ -60,6 +62,32 @@ pub fn letterbox(cols: u16, rows: u16, w_pt: f64, h_pt: f64) -> Letterbox {
         // 高さ律速。
         (clamp_dim(2.0 * rows_f * w_pt / h_pt, cols), rows)
     };
+    Letterbox {
+        icols,
+        irows,
+        off_col: (cols - icols) / 2,
+        off_row: (rows - irows) / 2,
+    }
+}
+
+/// 本文サイズ基準で inner グリッド寸法＋オフセットを求める（密詰め＝可読サイジング）。
+///
+/// アスペクト基準の [`letterbox`] は `pt_per_col = w_pt/icols` がグリフ advance より
+/// 小さくなり、比例配置でテキストが間延びする。本関数は本文フォント `body_pt` から
+/// `pt_per_col ≈ body/2`・`pt_per_row ≈ body` になるよう
+/// `icols = round(2*w_pt/body)`・`irows = round(h_pt/body)` を選ぶ。これで欧文 1 文字
+/// ≒ 1 セル、CJK（[`CellWidth::Wide`](paladocs_render::CellWidth) で 2 セル）も詰まる。
+/// セルの視覚アスペクトを 1:2 とみなすと `icols : irows*2 == w : h` になり、スライドの
+/// アスペクトも保たれる。各寸法は `1..=(cols|rows)` にクランプし中央寄せする。
+///
+/// `body_pt <= 0`（テキスト無し等）や `cols/rows == 0`・`w/h <= 0` のときはアスペクト
+/// 基準の [`letterbox`] にフォールバックする。
+pub fn text_grid(cols: u16, rows: u16, w_pt: f64, h_pt: f64, body_pt: f64) -> Letterbox {
+    if cols == 0 || rows == 0 || w_pt <= 0.0 || h_pt <= 0.0 || body_pt <= 0.0 {
+        return letterbox(cols, rows, w_pt, h_pt);
+    }
+    let icols = clamp_dim(2.0 * w_pt / body_pt, cols);
+    let irows = clamp_dim(h_pt / body_pt, rows);
     Letterbox {
         icols,
         irows,
@@ -177,6 +205,38 @@ mod tests {
         let lb0 = letterbox(0, 0, 100.0, 100.0);
         assert_eq!(lb0.icols, 0);
         assert_eq!(lb0.irows, 0);
+    }
+
+    #[test]
+    fn text_grid_sizes_from_body_font() {
+        // 842x474 pt のスライド・本文 16pt を広い端末(200x60)へ。
+        // icols = round(2*842/16) = round(105.25) = 105、irows = round(474/16) = round(29.6) = 30。
+        // 判別: アスペクト基準なら幅律速で icols=200 になり落ちる。
+        let lb = text_grid(200, 60, 842.0, 474.0, 16.0);
+        assert_eq!(lb.icols, 105);
+        assert_eq!(lb.irows, 30);
+        assert_eq!(lb.off_col, (200 - 105) / 2);
+        assert_eq!(lb.off_row, (60 - 30) / 2);
+    }
+
+    #[test]
+    fn text_grid_clamps_to_terminal_width() {
+        // 端末が本文容量より狭い → icols は端末幅にクランプ・オフセット 0。
+        let lb = text_grid(50, 60, 842.0, 474.0, 16.0);
+        assert_eq!(lb.icols, 50);
+        assert_eq!(lb.off_col, 0);
+    }
+
+    #[test]
+    fn text_grid_falls_back_to_aspect_when_no_body() {
+        // body_pt <= 0（テキスト無し）→ アスペクト基準の letterbox と一致。
+        let cols = 40;
+        let rows = 40;
+        let (w, h) = (1600.0, 900.0);
+        assert_eq!(
+            text_grid(cols, rows, w, h, 0.0),
+            letterbox(cols, rows, w, h)
+        );
     }
 
     #[test]

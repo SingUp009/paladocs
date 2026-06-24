@@ -310,7 +310,7 @@ impl CellRunner {
         let rows = self.viewport.rows.min(u16::MAX as u32) as u16;
         let w_pt = self.deck.meta.page_pt.w as f64;
         let h_pt = self.deck.meta.page_pt.h as f64;
-        let lb = letterbox::letterbox(cols, rows, w_pt, h_pt);
+        let lb = letterbox::text_grid(cols, rows, w_pt, h_pt, self.compiled.body_size_pt);
         let opts = RenderOpts {
             cols: lb.icols,
             rows: lb.irows,
