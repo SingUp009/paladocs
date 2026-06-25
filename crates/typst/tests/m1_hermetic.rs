@@ -272,7 +272,7 @@ fn render_step_dims_and_invariants() {
         rows: 8,
         pixel_per_pt: 3.0,
     };
-    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let grid = render_step(&compiled, 0, &opts).unwrap().grid;
     assert_eq!(grid.dims(), (20, 8)); // dims 不変条件
     for row in grid.rows() {
         for cell in row {
@@ -308,7 +308,7 @@ fn render_step_no_text_no_shape_is_transparent() {
         rows: 6,
         pixel_per_pt: 2.0,
     };
-    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let grid = render_step(&compiled, 0, &opts).unwrap().grid;
     for row in grid.rows() {
         for cell in row {
             assert_eq!(cell.ch, ' ', "no content → blank");
@@ -331,7 +331,7 @@ fn render_step_latin_text_is_crisp_default_fg() {
         rows: 16,
         pixel_per_pt: 4.0,
     };
-    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let grid = render_step(&compiled, 0, &opts).unwrap().grid;
     let letters: Vec<&_> = grid
         .rows()
         .flat_map(|r| r.iter())
@@ -364,13 +364,40 @@ fn render_step_stroked_rect_draws_box_outline() {
         rows: 30,
         pixel_per_pt: 2.0,
     };
-    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let grid = render_step(&compiled, 0, &opts).unwrap().grid;
     let box_chars = ['┌', '┐', '└', '┘', '─', '│'];
     let has_box = grid
         .rows()
         .flat_map(|r| r.iter())
         .any(|c| box_chars.contains(&c.ch));
     assert!(has_box, "stroked rect must render as box-drawing outline");
+}
+
+#[test]
+fn render_step_big_heading_emits_span() {
+    // 本文 10pt が支配的・見出し 30pt（ratio 3）→ 拡大 span が出る。
+    // 判別: span を作らない実装は空になり落ちる。
+    let project = TempProject::new(
+        &(pdfpc(&[(0, "1")])
+            + "#set page(width: 200pt, height: 100pt, margin: 4pt, fill: white)\n#text(size: 30pt)[BIG]\n\n#text(size: 10pt)[body body body body body body body]"),
+    );
+    let (_world, compiled) = compile_ok(&project);
+    let opts = RenderOpts {
+        cols: 80,
+        rows: 20,
+        pixel_per_pt: 2.0,
+    };
+    let out = render_step(&compiled, 0, &opts).unwrap();
+    assert!(!out.spans.is_empty(), "big heading should produce a span");
+    assert!(
+        out.spans.iter().any(|s| s.text.contains("BIG")),
+        "span text should include the heading"
+    );
+    // 見出しは grid にも通常セルとして残る（フォールバック）。
+    assert!(
+        out.grid.rows().flat_map(|r| r.iter()).any(|c| c.ch == 'B'),
+        "heading also kept as normal cells"
+    );
 }
 
 #[test]
@@ -387,7 +414,7 @@ fn render_step_fill_only_rect_draws_no_box() {
         rows: 30,
         pixel_per_pt: 2.0,
     };
-    let grid = render_step(&compiled, 0, &opts).unwrap();
+    let grid = render_step(&compiled, 0, &opts).unwrap().grid;
     let box_chars = ['┌', '┐', '└', '┘', '─', '│'];
     let has_box = grid
         .rows()

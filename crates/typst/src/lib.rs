@@ -32,5 +32,5 @@ mod world;
 
 pub use compiled::{CompiledDeck, compile_deck};
 pub use diag::{Diagnostic, EngineError, Severity};
-pub use project::{RenderOpts, render_step};
+pub use project::{RenderOpts, StepRender, render_step};
 pub use world::PaladocsWorld;

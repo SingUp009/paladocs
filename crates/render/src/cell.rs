@@ -354,6 +354,31 @@ fn box_range(idx: u32, samples: u32, dim: u32) -> (u32, u32) {
     }
 }
 
+/// セル span（複数セルへ拡大表示する 1 まとまりのテキスト）。
+///
+/// 端末（Knightty）が `cols × rows` のセル矩形へ `text`（1 つ以上の書記素）を拡大して
+/// 描く指示。論理グリッドのセル寸法は等幅のまま、字形だけが矩形へスケールされる。
+/// `render` は純粋なデータ型として保持するだけで、ワイヤ生成（OSC 7777）は `term`、
+/// 見出し→span の判定は `typst` の責務。
+///
+/// 不変条件（生成側が保証）: `cols >= 1`・`rows >= 1`、矩形はグリッド内に収まる、
+/// `text` は制御文字を含まない非空 UTF-8。`attrs` は端末が継承する強調属性。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellSpan {
+    /// 矩形左上のカラム（0 始まり）。
+    pub col: u16,
+    /// 矩形左上の行（0 始まり）。
+    pub row: u16,
+    /// 矩形のカラム数（`>= 1`）。
+    pub cols: u16,
+    /// 矩形の行数（`>= 1`）。
+    pub rows: u16,
+    /// 拡大表示するテキスト（制御文字なし・非空）。
+    pub text: String,
+    /// 端末が継承する強調属性（bold 等）。
+    pub attrs: CellAttrs,
+}
+
 /// 罫線（box-drawing）コーナースタイル。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BoxStyle {

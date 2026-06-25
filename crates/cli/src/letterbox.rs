@@ -10,7 +10,7 @@
 //! 合成は cli 側の責務（render に新 API を足さない）。inner を `CellGrid::set` で
 //! 余白入りの full グリッドへ焼き込む（[`compose_full`]、余白は端末既定で透過）。
 
-use paladocs_render::{CellGrid, Color};
+use paladocs_render::{CellGrid, CellSpan, Color};
 
 /// letterbox 余白の背景（端末既定色＝透過、[`paladocs_render::DEFAULT`]）。
 ///
@@ -151,10 +151,39 @@ pub fn compose_full(
     full
 }
 
+/// inner グリッド座標の span 群を `(off_col, off_row)` だけずらして full グリッド座標へ。
+///
+/// オフセット後に full グリッド `(cols, rows)` をはみ出す span は落とす（防御的：inner で
+/// 既にクランプ済みなら通常は全て収まる）。
+pub fn translate_spans(
+    spans: Vec<CellSpan>,
+    off_col: u16,
+    off_row: u16,
+    cols: u16,
+    rows: u16,
+) -> Vec<CellSpan> {
+    spans
+        .into_iter()
+        .filter_map(|mut s| {
+            let col = s.col.checked_add(off_col)?;
+            let row = s.row.checked_add(off_row)?;
+            if col as u32 + s.cols as u32 > cols as u32 {
+                return None;
+            }
+            if row as u32 + s.rows as u32 > rows as u32 {
+                return None;
+            }
+            s.col = col;
+            s.row = row;
+            Some(s)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paladocs_render::{Cell, CellAttrs, CellWidth};
+    use paladocs_render::{Cell, CellAttrs, CellSpan, CellWidth};
 
     const WHITE: Color = [255, 255, 255, 255];
 
@@ -237,6 +266,31 @@ mod tests {
             text_grid(cols, rows, w, h, 0.0),
             letterbox(cols, rows, w, h)
         );
+    }
+
+    fn span(col: u16, row: u16, cols: u16, rows: u16) -> CellSpan {
+        CellSpan {
+            col,
+            row,
+            cols,
+            rows,
+            text: "X".to_string(),
+            attrs: CellAttrs::NONE,
+        }
+    }
+
+    #[test]
+    fn translate_spans_offsets_into_full_grid() {
+        let out = translate_spans(vec![span(1, 0, 4, 2)], 10, 5, 80, 24);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].col, out[0].row), (11, 5));
+        assert_eq!((out[0].cols, out[0].rows), (4, 2));
+    }
+
+    #[test]
+    fn translate_spans_drops_out_of_range() {
+        // 幅 100 は full(10) をはみ出す → 落とす。
+        assert!(translate_spans(vec![span(0, 0, 100, 1)], 0, 0, 10, 10).is_empty());
     }
 
     #[test]

@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use paladocs_render::{
-    BoxStyle, Cell, CellAttrs, CellGrid, CellWidth, Color, DEFAULT, Rect, draw_box, draw_hline,
-    draw_vline,
+    BoxStyle, Cell, CellAttrs, CellGrid, CellSpan, CellWidth, Color, DEFAULT, Rect, draw_box,
+    draw_hline, draw_vline,
 };
 use typst::layout::{Abs, Frame as TypstFrame, FrameItem, Point, Transform};
 use typst::text::TextItem;
@@ -46,19 +46,34 @@ pub struct RenderOpts {
     pub pixel_per_pt: f32,
 }
 
+/// [`render_step`] の出力。等幅セルの [`CellGrid`] と、見出しを複数セルへ拡大する
+/// [`CellSpan`] 列。
+///
+/// `grid` には見出しも**通常セルとして**含む（OSC を無視する端末でも通常サイズで
+/// 見えるフォールバック）。対応端末では `spans` を grid の上に重ねて拡大表示する。
+#[derive(Debug, Clone)]
+pub struct StepRender {
+    /// 等幅セルグリッド（地色透過・図形罫線・テキスト鮮明）。
+    pub grid: CellGrid,
+    /// 見出し run を拡大する span 列（grid 描画後に重ねる）。
+    pub spans: Vec<CellSpan>,
+}
+
 /// `compiled` の物理ページ `page_idx` を意味的 TUI 投影で `(cols, rows)` の
-/// [`CellGrid`] にする（地色は端末既定＝透過、図形はアウトライン罫線、テキストは鮮明）。
+/// [`StepRender`]（[`CellGrid`] ＋ 見出し [`CellSpan`]）にする（地色は端末既定＝透過、
+/// 図形はアウトライン罫線、テキストは鮮明）。
 ///
 /// 不変条件:
-/// - 出力 dims == `(opts.cols, opts.rows)`。
+/// - `grid` dims == `(opts.cols, opts.rows)`。
 /// - [`CellWidth::Wide`] の右隣は必ず [`CellWidth::Continuation`]（render 不変条件4）。
+/// - 各 span は grid 内に収まり、`cols >= 1`・`rows >= 1`。
 ///
 /// `page_idx` が範囲外なら [`EngineError::Render`]。
 pub fn render_step(
     compiled: &CompiledDeck,
     page_idx: usize,
     opts: &RenderOpts,
-) -> Result<CellGrid, EngineError> {
+) -> Result<StepRender, EngineError> {
     let pages = compiled.doc.pages();
     let page = pages.get(page_idx).ok_or_else(|| {
         EngineError::Render(format!(
@@ -78,7 +93,7 @@ pub fn render_step(
     collect_shapes(&page.frame, Transform::identity(), &mut shapes);
     draw_shapes(&mut grid, &shapes, frame_w_pt, frame_h_pt);
 
-    // --- テキストを鮮明なセルとして上書き ---
+    // --- テキストを鮮明なセルとして配置（見出しも通常セルで残す＝フォールバック）---
     let mut runs = Vec::new();
     collect_runs(
         &page.frame,
@@ -88,7 +103,84 @@ pub fn render_step(
     );
     place_runs(&mut grid, &runs, frame_w_pt, frame_h_pt);
 
-    Ok(grid)
+    // --- 見出し run を拡大 span に（対応端末で grid の上に重ねる）---
+    let spans = heading_spans(&runs, compiled.body_size_pt, frame_w_pt, frame_h_pt, &grid);
+
+    Ok(StepRender { grid, spans })
+}
+
+/// 見出しティア（`round(size/body) >= 2`）の run を [`CellSpan`] に変換する。
+///
+/// span 矩形は run のアンカー（比例位置）から `cols = natural_cols * ratio`・
+/// `rows = ratio`。grid からはみ出す場合は矩形がアンカーから収まるようクランプし、
+/// 自然幅すら入らない（クランプ後 `cols < natural_cols`）見出しは span 化しない
+/// （通常セルのまま）。`body_pt <= 0` のときは span を作らない。
+fn heading_spans(
+    runs: &[PlacedRun],
+    body_pt: f64,
+    frame_w_pt: f64,
+    frame_h_pt: f64,
+    grid: &CellGrid,
+) -> Vec<CellSpan> {
+    let (cols, rows) = grid.dims();
+    if cols == 0 || rows == 0 || body_pt <= 0.0 || frame_w_pt <= 0.0 || frame_h_pt <= 0.0 {
+        return Vec::new();
+    }
+    let pt_per_col = frame_w_pt / cols as f64;
+    let pt_per_row = frame_h_pt / rows as f64;
+
+    let mut spans = Vec::new();
+    for run in runs {
+        let ratio = (run.size_pt / body_pt).round();
+        if !ratio.is_finite() || ratio < 2.0 {
+            continue; // 本文・小見出しは通常セルのまま
+        }
+        let ratio = ratio as u16;
+
+        // テキストと自然セル幅（空白も 1 セル換算）。
+        let text: String = run.glyphs.iter().map(|g| g.ch).collect();
+        if text.is_empty() {
+            continue;
+        }
+        let natural_cols: u32 = run
+            .glyphs
+            .iter()
+            .map(|g| if g.width == CellWidth::Wide { 2 } else { 1 })
+            .sum();
+        if natural_cols == 0 {
+            continue;
+        }
+
+        // アンカー（place_runs と同じ基準）。
+        let col_f = (run.x_pt / pt_per_col).round();
+        let row_f = (run.y_pt / pt_per_row).floor();
+        if !col_f.is_finite() || !row_f.is_finite() || col_f < 0.0 || row_f < 0.0 {
+            continue;
+        }
+        let (col, row) = (col_f as u32, row_f as u32);
+        if col >= cols as u32 || row >= rows as u32 {
+            continue;
+        }
+
+        // アンカーから収まるよう矩形をクランプ。自然幅が入らなければ span 化しない。
+        let avail_cols = cols as u32 - col;
+        let avail_rows = rows as u32 - row;
+        if natural_cols > avail_cols || avail_rows == 0 {
+            continue;
+        }
+        let span_cols = (natural_cols * ratio as u32).min(avail_cols);
+        let span_rows = (ratio as u32).min(avail_rows);
+
+        spans.push(CellSpan {
+            col: col as u16,
+            row: row as u16,
+            cols: span_cols as u16,
+            rows: span_rows as u16,
+            text,
+            attrs: run.attrs,
+        });
+    }
+    spans
 }
 
 /// H1（本文の 1.5 倍以上）ティアの相対閾値。
@@ -128,6 +220,8 @@ struct PlacedRun {
     x_pt: f64,
     /// baseline の y（ページ pt）。行の決定に使う。
     y_pt: f64,
+    /// テキストサイズ（pt）。見出し span の拡大率（`round(size/body)`）に使う。
+    size_pt: f64,
     /// サイズティアから決めた属性（[`CellAttrs`]）。run 内全セル共通。
     attrs: CellAttrs,
     /// 出現順のグリフ列。
@@ -179,7 +273,8 @@ fn collect_text(
     // v1 は文字色を端末既定（DEFAULT）に統一する（テーマ追従・暗い端末でも可読）。
     // Typst のテキスト色は今は採らない（将来、明確な着色のみ truecolor 化する成長点）。
     let fg = Some(DEFAULT);
-    let attrs = tier_attrs(text.size.to_pt(), body_pt);
+    let size_pt = text.size.to_pt();
+    let attrs = tier_attrs(size_pt, body_pt);
 
     let mut advance = Abs::zero();
     let mut glyphs: Vec<RunGlyph> = Vec::new();
@@ -223,6 +318,7 @@ fn collect_text(
         out.push(PlacedRun {
             x_pt,
             y_pt,
+            size_pt,
             attrs,
             glyphs,
         });
@@ -484,11 +580,29 @@ mod tests {
         }
     }
 
-    /// `x_pt` 起点・`attrs` の単一 run（y_pt=0）を作る。
+    /// `x_pt` 起点・`attrs` の単一 run（y_pt=0・size_pt=0）を作る。
     fn run(x_pt: f64, attrs: CellAttrs, glyphs: Vec<RunGlyph>) -> PlacedRun {
         PlacedRun {
             x_pt,
             y_pt: 0.0,
+            size_pt: 0.0,
+            attrs,
+            glyphs,
+        }
+    }
+
+    /// `(x_pt, y_pt, size_pt)` 指定の単一 run（heading_spans 用）。
+    fn run_sized(
+        x_pt: f64,
+        y_pt: f64,
+        size_pt: f64,
+        attrs: CellAttrs,
+        glyphs: Vec<RunGlyph>,
+    ) -> PlacedRun {
+        PlacedRun {
+            x_pt,
+            y_pt,
+            size_pt,
             attrs,
             glyphs,
         }
@@ -689,6 +803,112 @@ mod tests {
         assert_eq!(tier_attrs(11.0, body), CellAttrs::NONE); // 本文
         // body <= 0（テキスト無し）は全 NONE。
         assert_eq!(tier_attrs(99.0, 0.0), CellAttrs::NONE);
+    }
+
+    // ---- 見出し span ----
+
+    #[test]
+    fn heading_run_becomes_span() {
+        // body 10pt・見出し 20pt → ratio 2。pt_per_col=1（frame_w=cols=20）。
+        // "AB"(narrow×2) → natural_cols=2 → cols=4, rows=2。
+        let grid = unit_grid(20, 4);
+        let r = run_sized(
+            0.0,
+            0.0,
+            20.0,
+            CellAttrs::BOLD,
+            vec![
+                rg(1.0, 'A', CellWidth::Narrow, Some(FG)),
+                rg(1.0, 'B', CellWidth::Narrow, Some(FG)),
+            ],
+        );
+        let spans = heading_spans(&[r], 10.0, 20.0, 4.0, &grid);
+        assert_eq!(spans.len(), 1);
+        let s = &spans[0];
+        assert_eq!((s.col, s.row, s.cols, s.rows), (0, 0, 4, 2));
+        assert_eq!(s.text, "AB");
+        assert!(s.attrs.contains(CellAttrs::BOLD));
+    }
+
+    #[test]
+    fn body_run_makes_no_span() {
+        // ratio = round(11/10) = 1 < 2 → span 無し。
+        let grid = unit_grid(20, 4);
+        let r = run_sized(
+            0.0,
+            0.0,
+            11.0,
+            CellAttrs::NONE,
+            vec![rg(1.0, 'x', CellWidth::Narrow, Some(FG))],
+        );
+        assert!(heading_spans(&[r], 10.0, 20.0, 4.0, &grid).is_empty());
+    }
+
+    #[test]
+    fn no_body_size_makes_no_span() {
+        let grid = unit_grid(20, 4);
+        let r = run_sized(
+            0.0,
+            0.0,
+            40.0,
+            CellAttrs::BOLD,
+            vec![rg(1.0, 'A', CellWidth::Narrow, Some(FG))],
+        );
+        assert!(heading_spans(&[r], 0.0, 20.0, 4.0, &grid).is_empty());
+    }
+
+    #[test]
+    fn heading_span_wide_natural_width() {
+        // CJK 見出し "見出"（Wide×2）→ natural_cols=4, ratio=2 → cols=8, rows=2。
+        let grid = unit_grid(20, 4);
+        let r = run_sized(
+            0.0,
+            0.0,
+            20.0,
+            CellAttrs::BOLD,
+            vec![
+                rg(2.0, '見', CellWidth::Wide, Some(FG)),
+                rg(2.0, '出', CellWidth::Wide, Some(FG)),
+            ],
+        );
+        let spans = heading_spans(&[r], 10.0, 20.0, 4.0, &grid);
+        assert_eq!((spans[0].cols, spans[0].rows), (8, 2));
+        assert_eq!(spans[0].text, "見出");
+    }
+
+    #[test]
+    fn heading_span_clamps_to_grid() {
+        // body 5・size 40 → ratio 8, natural 2 → cols=16 を 10 にクランプ、rows=8 を 4 に。
+        let grid = unit_grid(10, 4);
+        let r = run_sized(
+            0.0,
+            0.0,
+            40.0,
+            CellAttrs::BOLD,
+            vec![
+                rg(1.0, 'A', CellWidth::Narrow, Some(FG)),
+                rg(1.0, 'B', CellWidth::Narrow, Some(FG)),
+            ],
+        );
+        let spans = heading_spans(&[r], 5.0, 10.0, 4.0, &grid);
+        assert_eq!((spans[0].cols, spans[0].rows), (10, 4));
+    }
+
+    #[test]
+    fn heading_span_skipped_when_natural_width_exceeds_avail() {
+        // アンカー列3（frame_w=4, pt_per_col=1）→ avail=1 < natural 2 → span 化しない。
+        let grid = unit_grid(4, 4);
+        let r = run_sized(
+            3.0,
+            0.0,
+            20.0,
+            CellAttrs::BOLD,
+            vec![
+                rg(1.0, 'A', CellWidth::Narrow, Some(FG)),
+                rg(1.0, 'B', CellWidth::Narrow, Some(FG)),
+            ],
+        );
+        assert!(heading_spans(&[r], 10.0, 4.0, 4.0, &grid).is_empty());
     }
 
     /// cell_width: ラテン=Narrow、CJK=Wide、結合/ゼロ幅=None。

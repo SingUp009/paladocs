@@ -42,12 +42,17 @@ pub use error::CliError;
 pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     let command = cli::parse_args(args).map_err(CliError::Usage)?;
     match command {
-        Command::Present { root, mode } => app::run_present(&root, mode),
+        Command::Present {
+            root,
+            mode,
+            cell_spans,
+        } => app::run_present(&root, mode, cell_spans),
         Command::Preview {
             root,
             control,
             mode,
-        } => app::run_preview(&root, control.as_deref(), mode),
+            cell_spans,
+        } => app::run_preview(&root, control.as_deref(), mode, cell_spans),
         Command::Build { root, out } => pdf::run_build(&root, &out),
     }
 }

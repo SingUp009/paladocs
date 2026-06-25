@@ -17,7 +17,9 @@
 //!
 //! フレーム先頭・末尾で `\x1b[0m` を発行し状態をフレーム間にリークさせない（不変条件 1）。
 
-use paladocs_render::{Cell, CellAttrs, CellGrid, CellRun, CellWidth, Color, changed_runs};
+use paladocs_render::{
+    Cell, CellAttrs, CellGrid, CellRun, CellSpan, CellWidth, Color, DEFAULT, changed_runs,
+};
 use std::io::{self, Write};
 
 /// `(BOLD, DIM, ITALIC, UNDERLINE, REVERSE)` → SGR コードの対応表。
@@ -98,6 +100,38 @@ impl<W: Write> CellSink<W> {
         self.reset()?;
         for run in runs {
             self.emit_run(new, run, origin)?;
+        }
+        self.reset()
+    }
+
+    /// 見出し [`CellSpan`] 列を Knightty の OSC 7777（cell span）として発行する。
+    ///
+    /// `ESC ] 7777 ; knightty ; span=<cols>x<rows> : <text> ESC \`（ST 終端）。各 span の
+    /// 前に端末既定 fg/bg（SGR `39`/`49`）＋ `attrs`（bold 等）を発行し、Knightty に拡大
+    /// テキストの継承属性を伝える。アンカーへ CUP（`origin` 1-indexed ＋ セル位置）して
+    /// から OSC を置く。**グリッド描画の後に呼ぶこと**（矩形内へ書き込むと span は解除
+    /// されるため）。`origin` は letterbox の左上（1-indexed）。
+    ///
+    /// 非対応端末は OSC 7777 を無視するが、見出しは grid に通常セルとして残るため
+    /// 通常サイズで表示される（graceful fallback）。
+    pub fn draw_spans(&mut self, spans: &[CellSpan], origin: (u16, u16)) -> io::Result<()> {
+        if spans.is_empty() {
+            return Ok(());
+        }
+        self.reset()?;
+        for s in spans {
+            // 継承元 SGR: 端末既定 fg/bg ＋ span 属性。
+            self.write_full_sgr(DEFAULT, DEFAULT, s.attrs)?;
+            // アンカーへ CUP（1-indexed）。
+            let row = origin.0 as u32 + s.row as u32;
+            let col = origin.1 as u32 + s.col as u32;
+            write!(self.w, "\x1b[{row};{col}H")?;
+            // OSC 7777（ST 終端）。
+            write!(
+                self.w,
+                "\x1b]7777;knightty;span={}x{}:{}\x1b\\",
+                s.cols, s.rows, s.text
+            )?;
         }
         self.reset()
     }
@@ -300,6 +334,38 @@ mod tests {
         assert!(s.contains("49"), "default bg must emit 49: {s:?}");
         assert!(!s.contains("38;2;"), "must not emit truecolor fg: {s:?}");
         assert!(!s.contains("48;2;"), "must not emit truecolor bg: {s:?}");
+    }
+
+    #[test]
+    fn draw_spans_emits_osc_7777_with_anchor_and_attrs() {
+        use paladocs_render::CellSpan;
+        let spans = [CellSpan {
+            col: 0,
+            row: 0,
+            cols: 12,
+            rows: 2,
+            text: "始めに".to_string(),
+            attrs: CellAttrs::BOLD,
+        }];
+        let mut sink = CellSink::new(Vec::new());
+        sink.draw_spans(&spans, (1, 1)).unwrap();
+        let s = out(sink);
+        // OSC 7777（Knightty 名前空間 ＋ span=12x2 ＋ テキスト ＋ ST）。
+        assert!(
+            s.contains("\x1b]7777;knightty;span=12x2:始めに\x1b\\"),
+            "osc: {s:?}"
+        );
+        // アンカー CUP（origin(1,1)+ (0,0) = 1;1）。
+        assert!(s.contains("\x1b[1;1H"), "cup: {s:?}");
+        // 継承 SGR: bold ＋ 端末既定 fg/bg。
+        assert!(s.contains("\x1b[1;39;49m"), "sgr: {s:?}");
+    }
+
+    #[test]
+    fn draw_spans_empty_writes_nothing() {
+        let mut sink = CellSink::new(Vec::new());
+        sink.draw_spans(&[], (1, 1)).unwrap();
+        assert!(out(sink).is_empty());
     }
 
     #[test]

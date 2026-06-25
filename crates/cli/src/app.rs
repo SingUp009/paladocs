@@ -11,9 +11,11 @@ use std::thread;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use paladocs_core::{Deck, FrameId};
-use paladocs_render::{CellGrid, Frame};
+use paladocs_render::{CellGrid, CellSpan, Frame};
 use paladocs_term::{CellSink, KittyBackend, Presenter, Viewport};
-use paladocs_typst::{CompiledDeck, PaladocsWorld, RenderOpts, compile_deck, render_step};
+use paladocs_typst::{
+    CompiledDeck, PaladocsWorld, RenderOpts, StepRender, compile_deck, render_step,
+};
 
 use crate::cache::{FrameCache, Key};
 use crate::cli::Mode;
@@ -288,10 +290,17 @@ struct CellRunner {
     viewport: Viewport,
     /// diff 基準となる「現在表示中の full グリッド」。
     prev: Option<CellGrid>,
+    /// 見出しを Knightty OSC 7777（cell span）で拡大するか（`--no-cell-spans` で無効）。
+    cell_spans: bool,
 }
 
 impl CellRunner {
-    fn new(world: PaladocsWorld, compiled: CompiledDeck, viewport: Viewport) -> Self {
+    fn new(
+        world: PaladocsWorld,
+        compiled: CompiledDeck,
+        viewport: Viewport,
+        cell_spans: bool,
+    ) -> Self {
         let deck = compiled.deck.clone();
         Self {
             world,
@@ -300,12 +309,13 @@ impl CellRunner {
             state: PresentState::start(),
             viewport,
             prev: None,
+            cell_spans,
         }
     }
 
-    /// 現 viewport・現 step を letterbox 込み full グリッド（dims == 端末 `(cols,rows)`）へ
-    /// 投影する。失敗は診断して `None`。
-    fn render_full(&mut self) -> Option<CellGrid> {
+    /// 現 viewport・現 step を letterbox 込み full グリッド（dims == 端末 `(cols,rows)`）と、
+    /// full 座標へ写した見出し span へ投影する。失敗は診断して `None`。
+    fn render_full(&mut self) -> Option<(CellGrid, Vec<CellSpan>)> {
         let cols = self.viewport.cols.min(u16::MAX as u32) as u16;
         let rows = self.viewport.rows.min(u16::MAX as u32) as u16;
         let w_pt = self.deck.meta.page_pt.w as f64;
@@ -317,9 +327,12 @@ impl CellRunner {
             pixel_per_pt: letterbox::ppp_for(lb.irows, h_pt),
         };
         match render_step(&self.compiled, self.state.cur.0 as usize, &opts) {
-            Ok(inner) => Some(letterbox::compose_full(
-                &inner, cols, rows, lb.off_col, lb.off_row, DEFAULT_BG,
-            )),
+            Ok(StepRender { grid: inner, spans }) => {
+                let full =
+                    letterbox::compose_full(&inner, cols, rows, lb.off_col, lb.off_row, DEFAULT_BG);
+                let spans = letterbox::translate_spans(spans, lb.off_col, lb.off_row, cols, rows);
+                Some((full, spans))
+            }
             Err(e) => {
                 let _ = diag::report_engine_error(&mut io::stderr(), &e);
                 None
@@ -339,13 +352,18 @@ impl CellRunner {
     /// それ以外は直前グリッドとの [`CellSink::draw_diff`]（`prev` 無しは全描画）。
     /// いずれも diff 基準 `prev` を更新する。
     fn emit(&mut self, sink: &mut dyn Write, full_redraw: bool) -> io::Result<()> {
-        let Some(grid) = self.render_full() else {
+        let Some((grid, spans)) = self.render_full() else {
             return Ok(());
         };
         let mut cs = CellSink::new(&mut *sink);
         match (&self.prev, full_redraw) {
             (Some(prev), false) => cs.draw_diff(prev, &grid, (1, 1))?,
             _ => cs.draw_full(&grid, (1, 1))?,
+        }
+        // span はグリッド描画の**後**に重ねる（矩形内への書き込みは span を解除するため）。
+        // diff で span 矩形に触れても、毎回再発行することで復元される。
+        if self.cell_spans {
+            cs.draw_spans(&spans, (1, 1))?;
         }
         self.prev = Some(grid);
         Ok(())
@@ -388,13 +406,18 @@ impl Stage for CellRunner {
 }
 
 /// `present`: キーボード対話プレゼン。
-pub fn run_present(root: &Path, mode: Mode) -> Result<(), CliError> {
-    run(root, None, mode)
+pub fn run_present(root: &Path, mode: Mode, cell_spans: bool) -> Result<(), CliError> {
+    run(root, None, mode, cell_spans)
 }
 
 /// `preview`: キー入力。`control` が `Some` なら制御 socket（Neovim 契約）も併用。
-pub fn run_preview(root: &Path, control: Option<&Path>, mode: Mode) -> Result<(), CliError> {
-    run(root, control, mode)
+pub fn run_preview(
+    root: &Path,
+    control: Option<&Path>,
+    mode: Mode,
+    cell_spans: bool,
+) -> Result<(), CliError> {
+    run(root, control, mode, cell_spans)
 }
 
 /// プレゼンタ本体。`present` と `preview` は入力源が違うだけで共有する。
@@ -402,7 +425,7 @@ pub fn run_preview(root: &Path, control: Option<&Path>, mode: Mode) -> Result<()
 /// 出口モードは起動時 1 回 [`resolve_mode`] で決め、以降ナビでは不変（resize は
 /// 再レンダのみ）。端末所有・panic hook・enter/leave 経路は image/cell 共通で、
 /// 出口だけ [`Runner`] / [`CellRunner`] を差し替えて [`drive`] に渡す。
-fn run(root: &Path, control: Option<&Path>, mode: Mode) -> Result<(), CliError> {
+fn run(root: &Path, control: Option<&Path>, mode: Mode, cell_spans: bool) -> Result<(), CliError> {
     let world = match PaladocsWorld::new(root) {
         Ok(w) => w,
         Err(e) => {
@@ -439,7 +462,11 @@ fn run(root: &Path, control: Option<&Path>, mode: Mode) -> Result<(), CliError> 
     let viewport = measure_viewport().map_err(CliError::Io)?;
     match output {
         OutputMode::Image => drive(Runner::new(world, compiled, viewport), out, control),
-        OutputMode::Cell => drive(CellRunner::new(world, compiled, viewport), out, control),
+        OutputMode::Cell => drive(
+            CellRunner::new(world, compiled, viewport, cell_spans),
+            out,
+            control,
+        ),
     }
     // ここで `_guard` が drop → 端末復元。
 }

@@ -40,6 +40,8 @@ pub enum Command {
         root: PathBuf,
         /// 出口レンダラ選択。
         mode: Mode,
+        /// cell モードで見出しを Knightty OSC 7777 で拡大するか（`--no-cell-spans` で false）。
+        cell_spans: bool,
     },
     /// プレビュー。キー入力で操作し、`--control` 指定時は Neovim 契約の制御 socket
     /// からもコマンドを受ける（socket は任意）。
@@ -50,6 +52,8 @@ pub enum Command {
         control: Option<PathBuf>,
         /// 出口レンダラ選択。
         mode: Mode,
+        /// cell モードで見出しを Knightty OSC 7777 で拡大するか（`--no-cell-spans` で false）。
+        cell_spans: bool,
     },
     /// PDF 書き出し（対話なし）。
     Build {
@@ -65,8 +69,8 @@ pub const USAGE: &str = "\
 paladocs — Typst presenter
 
 USAGE:
-    paladocs present <ROOT.typ> [--mode auto|image|cell]
-    paladocs preview <ROOT.typ> [--control <SOCKET>] [--mode auto|image|cell]
+    paladocs present <ROOT.typ> [--mode auto|image|cell] [--no-cell-spans]
+    paladocs preview <ROOT.typ> [--control <SOCKET>] [--mode auto|image|cell] [--no-cell-spans]
     paladocs build   <ROOT.typ> -o <OUT.pdf>";
 
 /// プログラム名を除いた引数列 `args` を [`Command`] へ解析する。
@@ -79,9 +83,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         "present" => {
             let mut root: Option<PathBuf> = None;
             let mut mode: Option<Mode> = None;
+            let mut cell_spans = true;
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     "--mode" => set_mode_once(&mut mode, it.next())?,
+                    "--no-cell-spans" => cell_spans = false,
                     other if other.starts_with('-') => {
                         return Err(format!("unknown flag: {other}"));
                     }
@@ -92,18 +98,21 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             Ok(Command::Present {
                 root,
                 mode: mode.unwrap_or_default(),
+                cell_spans,
             })
         }
         "preview" => {
             let mut root: Option<PathBuf> = None;
             let mut control: Option<PathBuf> = None;
             let mut mode: Option<Mode> = None;
+            let mut cell_spans = true;
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     "--control" => {
                         control = Some(positional(it.next(), "SOCKET")?);
                     }
                     "--mode" => set_mode_once(&mut mode, it.next())?,
+                    "--no-cell-spans" => cell_spans = false,
                     other if other.starts_with('-') => {
                         return Err(format!("unknown flag: {other}"));
                     }
@@ -115,6 +124,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 root,
                 control,
                 mode: mode.unwrap_or_default(),
+                cell_spans,
             })
         }
         "build" => {
@@ -181,6 +191,7 @@ mod tests {
             Ok(Command::Present {
                 root: PathBuf::from("deck.typ"),
                 mode: Mode::Auto,
+                cell_spans: true,
             })
         );
     }
@@ -193,6 +204,7 @@ mod tests {
                 root: PathBuf::from("deck.typ"),
                 control: Some(PathBuf::from("/tmp/p.sock")),
                 mode: Mode::Auto,
+                cell_spans: true,
             })
         );
     }
@@ -205,6 +217,7 @@ mod tests {
                 root: PathBuf::from("deck.typ"),
                 control: Some(PathBuf::from("s.sock")),
                 mode: Mode::Auto,
+                cell_spans: true,
             })
         );
     }
@@ -221,6 +234,7 @@ mod tests {
                 Ok(Command::Present {
                     root: PathBuf::from("deck.typ"),
                     mode: want,
+                    cell_spans: true,
                 })
             );
         }
@@ -233,6 +247,7 @@ mod tests {
             Ok(Command::Present {
                 root: PathBuf::from("deck.typ"),
                 mode: Mode::Cell,
+                cell_spans: true,
             })
         );
     }
@@ -252,6 +267,7 @@ mod tests {
                 root: PathBuf::from("deck.typ"),
                 control: Some(PathBuf::from("s.sock")),
                 mode: Mode::Cell,
+                cell_spans: true,
             })
         );
     }
@@ -262,6 +278,29 @@ mod tests {
             panic!("expected Present");
         };
         assert_eq!(mode, Mode::Auto);
+    }
+
+    #[test]
+    fn cell_spans_default_true_and_disabled_by_flag() {
+        // 既定は true。
+        let Ok(Command::Present { cell_spans, .. }) = parse_args(&argv(&["present", "deck.typ"]))
+        else {
+            panic!("expected Present");
+        };
+        assert!(cell_spans);
+        // --no-cell-spans で false（present・preview とも）。
+        let Ok(Command::Present { cell_spans, .. }) =
+            parse_args(&argv(&["present", "deck.typ", "--no-cell-spans"]))
+        else {
+            panic!("expected Present");
+        };
+        assert!(!cell_spans);
+        let Ok(Command::Preview { cell_spans, .. }) =
+            parse_args(&argv(&["preview", "deck.typ", "--no-cell-spans"]))
+        else {
+            panic!("expected Preview");
+        };
+        assert!(!cell_spans);
     }
 
     #[test]
@@ -304,6 +343,7 @@ mod tests {
                 root: PathBuf::from("deck.typ"),
                 control: None,
                 mode: Mode::Auto,
+                cell_spans: true,
             })
         );
     }
